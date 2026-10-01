@@ -192,4 +192,13 @@ oa = _pv.make_provider(cfg); pf = oa.preflight()
 assert oa.model == "configured-image-model" and pf["credentials_available"] is False and pf["model_available"] is None and pf["pricing_snapshot_available"] is False and pf["quality_tiers_available"] == {"high": True, "medium": True} and pf["generation_call_made"] is False
 assert "gpt-image-1" not in open(os.path.join(HERE, "..", "studio", "providers.py")).read()
 print(" M13. PASS OpenAI adapter takes its model from configuration only (no hard-coded model id); preflight is read-only and fails closed")
+# M14 credential variable resolution: OPENAI_API_KEY first, then the harness-safe LISTING_STUDIO_OPENAI_API_KEY; never the value
+for k in ("OPENAI_API_KEY", "LISTING_STUDIO_OPENAI_API_KEY"): os.environ.pop(k, None)
+assert oa.credentials_available() is False and oa.credential_env_name() is None
+os.environ["LISTING_STUDIO_OPENAI_API_KEY"] = "fixture-not-a-real-key"
+assert oa.credentials_available() is True and oa.credential_env_name() == "LISTING_STUDIO_OPENAI_API_KEY" and _pv._api_key() == "fixture-not-a-real-key"
+os.environ["OPENAI_API_KEY"] = "fixture-primary"; assert oa.credential_env_name() == "OPENAI_API_KEY"
+for k in ("OPENAI_API_KEY", "LISTING_STUDIO_OPENAI_API_KEY"): os.environ.pop(k, None)
+assert "credential_env_name" in oa.preflight() and oa.preflight()["credential_env_name"] is None
+print(" M14. PASS credential resolves from OPENAI_API_KEY, else LISTING_STUDIO_OPENAI_API_KEY; preflight reports the name only; no network call without a key")
 print("ALL PATCH TESTS PASS")

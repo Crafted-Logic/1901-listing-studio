@@ -9,8 +9,11 @@ Production configuration (no secrets) lives at config.PROVIDER_CONFIG_PATH:
                    "basis": "where these capabilities were verified (docs URL + date)"},
   "pricing_path": "/home/claude/.config/1901-listing-studio/pricing.json"
 }
-The model is never hard-coded. Credentials come only from the runtime environment (OPENAI_API_KEY)
-and are never stored, printed or logged.
+The model is never hard-coded. Credentials come only from the runtime environment and are never
+stored, printed or logged. The adapter reads OPENAI_API_KEY first, then LISTING_STUDIO_OPENAI_API_KEY:
+OpenMausBot's Claude launcher deliberately deletes OPENAI_API_KEY (and every other provider-credential
+name) from a bot's environment so a foreign key cannot change a CLI's billing identity, so the
+harness-safe name is the one that actually reaches Walter.
 
 provider.generate_scene(prompt, quality, size, metadata) -> {"png", "usage", "model", "quality", "size"}
 provider.supports_quality(q) / supports_size(s) -> bool      (from the configured capability record)
@@ -47,10 +50,11 @@ class Provider:
     def model_available(self): return None
     def pricing_snapshot(self): return None
     def generate_scene(self, prompt, quality, size, metadata): raise NotImplementedError
+    def credential_env_name(self): return None
     def preflight(self):
         snap = self.pricing_snapshot()
         return {"provider_configured": True, "provider": self.name, "model_configured": self.model, "size": self.size,
-                "credentials_available": self.credentials_available(), "model_available": self.model_available(),
+                "credentials_available": self.credentials_available(), "credential_env_name": self.credential_env_name(), "model_available": self.model_available(),
                 "quality_tiers_available": {q: self.supports_quality(q) for q in config.QUALITY_MIX}, "size_supported": self.supports_size(self.size),
                 "pricing_snapshot_available": snap is not None, "pricing_snapshot": {k: snap.get(k) for k in ("provider", "model", "size", "captured_at", "basis", "currency")} if snap else None,
                 "generation_call_made": False}
@@ -112,9 +116,26 @@ def draw_scene(size, color, slot, behaviour="ok", marker_pattern="uniform"):
     return img
 
 
+CREDENTIAL_ENV_NAMES = ("OPENAI_API_KEY", "LISTING_STUDIO_OPENAI_API_KEY")
+
+
+def _api_key_env_name():
+    """Name of the first non-empty credential variable, or None. The value is never returned here."""
+    for name in CREDENTIAL_ENV_NAMES:
+        if os.environ.get(name):
+            return name
+    return None
+
+
+def _api_key():
+    name = _api_key_env_name()
+    return os.environ.get(name) if name else None
+
+
 class OpenAIImagesProvider(Provider):
     """OpenAI Images API with the model taken from the provider configuration. The key is read from
-    the environment at call time and never stored, printed, or logged. Not exercised live by tests."""
+    the environment at call time (see CREDENTIAL_ENV_NAMES) and never stored, printed, or logged.
+    Not exercised live by tests."""
     name = "openai"
     ENDPOINT = "https://api.openai.com/v1/images/generations"
     MODELS = "https://api.openai.com/v1/models/"
@@ -125,12 +146,13 @@ class OpenAIImagesProvider(Provider):
 
     def supports_quality(self, quality): return quality in self._qualities
     def supports_size(self, size): return size in self._sizes
-    def credentials_available(self): return bool(os.environ.get("OPENAI_API_KEY"))
+    def credentials_available(self): return _api_key() is not None
+    def credential_env_name(self): return _api_key_env_name()
     def pricing_snapshot(self): return pricing.load_snapshot(self._pricing_path, self.name, self.model, self.size)
 
     def model_available(self):
         """GET /v1/models/<model>: free metadata call; True/False, or None if it could not be checked."""
-        key = os.environ.get("OPENAI_API_KEY")
+        key = _api_key()
         if not key: return None
         try:
             req = urllib.request.Request(self.MODELS + self.model, headers={"Authorization": f"Bearer {key}"})
@@ -142,8 +164,8 @@ class OpenAIImagesProvider(Provider):
             return None
 
     def generate_scene(self, prompt, quality, size, metadata):
-        key = os.environ.get("OPENAI_API_KEY")
-        if not key: raise RuntimeError("OPENAI_API_KEY is not set")
+        key = _api_key()
+        if not key: raise RuntimeError("no image-provider credential in the environment (OPENAI_API_KEY or LISTING_STUDIO_OPENAI_API_KEY)")
         if not self.supports_quality(quality) or not self.supports_size(size): raise RuntimeError("requested quality or size is not in the configured capability record")
         body = json.dumps({"model": self.model, "prompt": prompt, "n": 1, "size": size, "quality": quality, "output_format": "png"}).encode()
         req = urllib.request.Request(self.ENDPOINT, data=body, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
