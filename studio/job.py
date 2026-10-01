@@ -85,6 +85,7 @@ def run(design_id, evidence, message, provider, handoff_root=config.HANDOFF_ROOT
            "campaign": {"root": campaign_root, "design_folder": "", "manifest_path": "", "qa_path": "", "contact_sheet_path": "", "images": []},
            "budget": {"per_listing_limit_usd": config.PER_LISTING_LIMIT_USD, "monthly_limit_usd": config.MONTHLY_LIMIT_USD, "estimated_job_cost_usd": 0, "monthly_recorded_cost_usd": 0, "projected_monthly_cost_usd": 0, "budget_flag": ""},
            "verification": {"queue_verified": False, "human_approval_verified": False, "source_verified": False, "handoff_verified": False, "product_spec_verified": False, "pricing_verified": False, "budget_verified": False, "qa_passed": False, "campaign_verified": False},
+           "rendering": {"provider": provider.name, "model": provider.model, "size": provider.size, "quality_mix": config.QUALITY_MIX, "mode": "composited_fidelity"},
            "authorization": {"received": False, "evidence": ""}, "proposed_expense_log_row": {}, "warnings": [], "checks": [], "human_action_required": None}
     checks, warnings, ver = out["checks"], out["warnings"], out["verification"]
     def chk(name, status, detail): checks.append({"check": name, "status": status, "detail": detail})
@@ -200,17 +201,23 @@ def run(design_id, evidence, message, provider, handoff_root=config.HANDOFF_ROOT
     out["product"] = {k: product[k] for k in ("blank", "provider", "color", "spec_source")}
     ver["product_spec_verified"] = True; chk("product_spec", "PASS", f"{product['blank']} / {product['provider']} / {product['color']} from {product['spec_source']}")
 
-    # 7 model / quality / pricing
-    for qlt in config.QUALITY_MIX:
-        if not provider.supports_quality(qlt):
-            chk("model_quality", "FAIL", f"provider {provider.name} ({provider.model}) does not offer quality tier '{qlt}'"); return done("MODEL_OR_QUALITY_BLOCK", f"The configured image provider cannot produce the governed quality mix (2 high, 4 medium). A substitute needs explicit human authorization; none was assumed.")
-    chk("model_quality", "PASS", f"{provider.name} / {provider.model} offers high and medium")
+    # 7 provider: credentials, configured model, quality tiers, size, pricing (all read-only; no generation call)
+    size = provider.size
+    if not provider.credentials_available():
+        chk("model_quality", "FAIL", f"no credentials are available in the runtime environment for provider {provider.name}"); return done("MODEL_OR_QUALITY_BLOCK", f"No image-provider credential is available to Walter for {provider.name}. Providing one is a credential decision for Jody; nothing was assumed and nothing was called.")
+    avail = provider.model_available()
+    if avail is False:
+        chk("model_quality", "FAIL", f"configured model '{provider.model}' is not available to these credentials"); return done("MODEL_OR_QUALITY_BLOCK", f"The configured image model {provider.model} is not available on {provider.name}. Configure an available model; no substitute was chosen.")
+    missing = [qlt for qlt in config.QUALITY_MIX if not provider.supports_quality(qlt)]
+    if missing or not provider.supports_size(size):
+        chk("model_quality", "FAIL", f"configured model '{provider.model}' capability record lacks " + (", ".join(f"quality '{q}'" for q in missing) if missing else f"size {size}")); return done("MODEL_OR_QUALITY_BLOCK", f"The configured model {provider.model} on {provider.name} is not recorded as supporting the governed quality mix (2 high, 4 medium) at {size}. A substitute model or tier needs explicit human authorization; none was assumed.")
+    chk("model_quality", "PASS", f"{provider.name} / {provider.model}: credentials present, model {'verified available' if avail else 'availability not checked offline'}, high and medium at {size} per the configured capability record")
     snap = provider.pricing_snapshot()
-    prices = {qlt: (pricing.cost_of(snap, qlt, config.IMAGE_SIZE) if snap else None) for qlt in config.QUALITY_MIX}
+    prices = {qlt: (pricing.cost_of(snap, qlt, size) if snap else None) for qlt in config.QUALITY_MIX}
     if snap is None or any(v is None for v in prices.values()):
-        chk("pricing", "FAIL", "no usable pricing snapshot for the configured provider/model/quality/size before spend"); return done("PRICING_UNAVAILABLE", f"Record a current pricing snapshot for {provider.name} / {provider.model} at {config.PRICING_PATH} (captured_at, basis, per_image_usd by quality and size). No per-image cost was guessed.")
-    ver["pricing_verified"] = True; chk("pricing", "PASS", f"{snap['provider']} / {snap['model']} captured {snap['captured_at']}: high ${prices['high']:.4f}, medium ${prices['medium']:.4f} per {config.IMAGE_SIZE} image ({snap['basis']})")
-    plan = [{"slot": s, "key": k, "role": role, "quality": qlt, "size": config.IMAGE_SIZE, "estimated_cost_usd": prices[qlt]} for s, k, role, qlt in config.SLOTS]
+        chk("pricing", "FAIL", f"no usable pricing snapshot for exactly {provider.name} / {provider.model} / {size} with both quality tiers before spend"); return done("PRICING_UNAVAILABLE", f"Record a current pricing snapshot for exactly {provider.name} / {provider.model} / {size} (provider, model, size, captured_at, basis, currency, per_image_usd by quality). A snapshot for another model is invalid; no per-image cost was guessed.")
+    ver["pricing_verified"] = True; chk("pricing", "PASS", f"{snap['provider']} / {snap['model']} / {snap['size']} captured {snap['captured_at']}: high ${prices['high']:.4f}, medium ${prices['medium']:.4f} per image ({snap['basis']})")
+    plan = [{"slot": s, "key": k, "role": role, "quality": qlt, "size": size, "model": provider.model, "estimated_cost_usd": prices[qlt]} for s, k, role, qlt in config.SLOTS]
     estimate = round(sum(p["estimated_cost_usd"] for p in plan), 6)
 
     # 8 budget
@@ -242,7 +249,7 @@ def run(design_id, evidence, message, provider, handoff_root=config.HANDOFF_ROOT
         chk("existing_campaign", "PASS", exdetail); return done("ALREADY_RENDERED", None)
     chk("existing_campaign", "PASS", "no campaign folder exists for this design")
 
-    row_base = {"design_id": did, "model": f"{provider.name}/{provider.model}", "quality_mix": config.QUALITY_MIX, "source_drive_id": info["drive_file_id"], "source_sha256": info["sha256"], "pricing_snapshot": snap, "campaign_folder": folder}
+    row_base = {"design_id": did, "model": f"{provider.name}/{provider.model}", "size": size, "quality_mix": config.QUALITY_MIX, "source_drive_id": info["drive_file_id"], "source_sha256": info["sha256"], "pricing_snapshot": snap, "campaign_folder": folder}
 
     # 10 authorization
     if not (auth and auth[0] == "OK"):
@@ -250,7 +257,7 @@ def run(design_id, evidence, message, provider, handoff_root=config.HANDOFF_ROOT
         else: chk("authorization", "FAIL", f"the current run does not contain the exact command AUTHORIZE LISTING RENDER {did}; ordinary requests and vague confirmations never authorize rendering")
         out["proposed_expense_log_row"] = {**row_base, "render_job_id": "", "started_at": "", "completed_at": "", "images_generated": 0, "rerolls": 0, "usage_record": [], "estimated_api_cost_usd": estimate, "job_status": "PROPOSED", "budget_flag": "OK", "notes": ["proposal only; no generation call made"], "actual_billed_cost_usd": None}
         out["campaign"]["images"] = [f"{p['slot']:02d}-{p['key']}.png" for p in plan]
-        return done("AWAITING_RENDER_AUTHORIZATION", f"No generation call made and no campaign files created. {did} is eligible: source {info['filename']} (Drive id {info['drive_file_id']}, sha256 {info['sha256'][:12]}…) staged at {info['staged_path']}; product {product['blank']} / {product['provider']} / {product['color']}; six scenes (2 high, 4 medium) on {provider.name}/{provider.model} at an estimated ${estimate:.4f}, month ${monthly:.4f} → ${whole['projected_monthly']:.4f}; output {folder}. To authorize exactly this render job, send exactly: AUTHORIZE LISTING RENDER {did}")
+        return done("AWAITING_RENDER_AUTHORIZATION", f"No generation call made and no campaign files created. {did} is eligible: source {info['filename']} (Drive id {info['drive_file_id']}, sha256 {info['sha256'][:12]}…) staged at {info['staged_path']}; product {product['blank']} / {product['provider']} / {product['color']}; six scenes (2 high, 4 medium) at {size} on {provider.name} / {provider.model} at an estimated ${estimate:.4f}, month ${monthly:.4f} → ${whole['projected_monthly']:.4f}; output {folder}. To authorize exactly this render job, send exactly: AUTHORIZE LISTING RENDER {did}")
     out["authorization"].update(received=True, evidence=auth[1]); chk("authorization", "PASS", f"current run contains the exact command: {auth[1]}")
 
     # 11 the job
@@ -260,7 +267,7 @@ def run(design_id, evidence, message, provider, handoff_root=config.HANDOFF_ROOT
     for sub in ("source", "generated-scenes", "final-composites", "qa"):
         os.makedirs(os.path.join(tmp, sub), exist_ok=False)
     started = now
-    cost = {"render_job_id": job_id, "design_id": did, "started_at": started, "completed_at": "", "model": row_base["model"], "quality_mix": config.QUALITY_MIX, "images_generated": 0, "rerolls": 0,
+    cost = {"render_job_id": job_id, "design_id": did, "started_at": started, "completed_at": "", "model": row_base["model"], "size": size, "quality_mix": config.QUALITY_MIX, "images_generated": 0, "rerolls": 0,
             "source_drive_id": info["drive_file_id"], "source_sha256": info["sha256"], "usage_record": [], "pricing_snapshot": snap, "estimated_api_cost_usd": 0, "campaign_folder": folder, "job_status": "RUNNING", "budget_flag": "OK", "notes": [], "actual_billed_cost_usd": None}
     images, scene_prompts = [], {}
 
@@ -303,12 +310,12 @@ def run(design_id, evidence, message, provider, handoff_root=config.HANDOFF_ROOT
                 flag = "STOPPED"; chk("budget", "FAIL", f"before scene {slot}{' reroll' if is_reroll else ''}: {b['reason']}; call not made")
                 return fail("STOPPED_BUDGET", f"Rendering {did} stopped before scene {slot}: {b['reason']}. {len(guard.usage)} image(s) generated so far; no further spend. A new AUTHORIZE LISTING RENDER {did} command is required after Jody decides on the budget.", "STOPPED")
             try:
-                g = provider.generate_scene(prompt, qlt, config.IMAGE_SIZE, {"design_id": did, "slot": slot, "role": role, "garment_rgb": product["garment_rgb"], "render_job_id": job_id, "reroll": is_reroll})
+                g = provider.generate_scene(prompt, qlt, size, {"design_id": did, "slot": slot, "role": role, "garment_rgb": product["garment_rgb"], "render_job_id": job_id, "reroll": is_reroll})
             except Exception as e:  # noqa: BLE001
                 chk(f"scene_{slot}", "FAIL", f"generation call failed ({e.__class__.__name__}: {e})"); return fail("GENERATION_FAILED", f"The image provider failed on scene {slot} for {did}. Check the provider, then re-run with a fresh AUTHORIZE LISTING RENDER {did}.")
-            guard.record(prices[qlt], g["usage"], slot, g["quality"], g["size"], reroll=is_reroll, reason=reroll_reason)
-            if g.get("quality") != qlt:
-                chk(f"scene_{slot}", "FAIL", f"provider returned quality '{g.get('quality')}' instead of '{qlt}'"); return fail("MODEL_OR_QUALITY_BLOCK", f"The provider substituted a different quality tier on scene {slot}; a substitute needs explicit human authorization.")
+            guard.record(prices[qlt], g["usage"], slot, g["quality"], g["size"], reroll=is_reroll, reason=reroll_reason, model=g.get("model"))
+            if g.get("quality") != qlt or g.get("model") != provider.model or g.get("size") != size:
+                chk(f"scene_{slot}", "FAIL", f"provider returned model '{g.get('model')}' quality '{g.get('quality')}' size '{g.get('size')}' instead of '{provider.model}' '{qlt}' '{size}'"); return fail("MODEL_OR_QUALITY_BLOCK", f"The provider substituted a different model, quality tier or size on scene {slot}; a substitute needs explicit human authorization.")
             base_name = f"{slot:02d}-{key}-base.png"; final_name = f"{slot:02d}-{key}.png"
             base_path = os.path.join(tmp, "generated-scenes", base_name); open(base_path, "wb").write(g["png"])
             try:
@@ -327,7 +334,7 @@ def run(design_id, evidence, message, provider, handoff_root=config.HANDOFF_ROOT
             except Exception as e:  # noqa: BLE001
                 chk(f"scene_{slot}", "FAIL", f"compositing error ({e.__class__.__name__}: {e})"); return fail("COMPOSITING_FAILED", f"Deterministic compositing failed on scene {slot} for {did}.")
             final_path = os.path.join(tmp, "final-composites", final_name); final_img.save(final_path, format="PNG")
-            result, qchecks, notes = qa.check_image(slot, role, base_path, final_path, art_path, placement, product, tuple(int(x) for x in config.IMAGE_SIZE.split("x")))
+            result, qchecks, notes = qa.check_image(slot, role, base_path, final_path, art_path, placement, product, tuple(int(x) for x in size.split("x")))
             img_rec = {"slot": slot, "role": role, "quality": qlt, "model": g["model"], "base_scene": f"generated-scenes/{base_name}", "final_composite": f"final-composites/{final_name}", "final_sha256": sha256_bytes(open(final_path, "rb").read()), "placement": placement, "qa_result": result, "checks": qchecks, "notes": notes, "source_sha256": info["sha256"], "product": {k: product[k] for k in ("blank", "provider", "color")}, "rerolls_used_here": attempt}
             if result != "PASS":
                 images.append(img_rec); chk(f"scene_{slot}", "FAIL", "deterministic QA: " + "; ".join(f"{k} {v['detail']}" for k, v in qchecks.items() if v["result"] == "FAIL"))
@@ -347,7 +354,7 @@ def run(design_id, evidence, message, provider, handoff_root=config.HANDOFF_ROOT
         manifest = {"schema_version": config.SCHEMA_VERSION, "design_id": did, "render_job_id": job_id, "created_at": now, "result": "READY_FOR_HUMAN_RENDER_REVIEW",
                     "source": {"drive_file_id": info["drive_file_id"], "drive_url": info["drive_url"], "filename": info["filename"], "sha256": info["sha256"], "staged_handoff_path": info["folder"], "staged_source_path": info["staged_path"], "campaign_copy": f"source/{info['filename']}", "lineage": "1901-stage-render-source handoff → exact byte copy → deterministic perspective composite"},
                     "product": {**{k: product[k] for k in ("blank", "provider", "color", "spec_source")}, "garment_rgb": list(product["garment_rgb"])},
-                    "rendering": {"mode": "composited_fidelity", "provider": provider.name, "model": provider.model, "size": config.IMAGE_SIZE, "quality_mix": config.QUALITY_MIX, "compositor": "pillow-perspective+shading-multiply", "artwork_transformations": "geometric and lighting only"},
+                    "rendering": {"mode": "composited_fidelity", "provider": provider.name, "model": provider.model, "size": size, "quality_mix": config.QUALITY_MIX, "pricing_snapshot": snap, "compositor": "marker-geometry + harmonic garment reconstruction + pillow-perspective + luminance-multiply", "artwork_transformations": "geometric and lighting only"},
                     "scene_slots": [{"slot": i["slot"], "role": i["role"], "quality": i["quality"], "model": i["model"], "prompt": scene_prompts[f"{i['slot']:02d}-{config.SLOTS[i['slot'] - 1][1]}"], "placement": i["placement"], "rerolls_used_here": i["rerolls_used_here"]} for i in images],
                     "generated_scenes": [i["base_scene"].split("/", 1)[1] for i in images], "final_composites": [i["final_composite"].split("/", 1)[1] for i in images], "final_sha256": {i["final_composite"].split("/", 1)[1]: i["final_sha256"] for i in images},
                     "qa_status": qa_doc["campaign_result"], "qa_path": "qa/qa.json", "contact_sheet": "qa/contact-sheet.png", "estimated_api_cost_usd": guard.job_cost, "reroll_count": guard.rerolls, "cost_log": "cost-log.json",

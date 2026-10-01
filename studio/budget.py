@@ -23,11 +23,11 @@ class BudgetGuard:
             return {"ok": False, "reason": f"next call would bring the month to ${month:.4f}, over the ${self.monthly_limit:.2f} monthly cap", "projected_job": job, "projected_monthly": month}
         return {"ok": True, "reason": "", "projected_job": job, "projected_monthly": month}
 
-    def record(self, cost, usage, slot, quality, size, reroll=False, reason=""):
+    def record(self, cost, usage, slot, quality, size, reroll=False, reason="", model=""):
         self.job_cost = round(self.job_cost + cost, 6)
         if reroll:
             self.rerolls += 1
-        self.usage.append({"slot": slot, "quality": quality, "size": size, "estimated_cost_usd": cost, "reroll": reroll, "reason": reason, "usage": usage})
+        self.usage.append({"slot": slot, "model": model, "quality": quality, "size": size, "estimated_cost_usd": cost, "reroll": reroll, "reason": reason, "usage": usage})
 
     def can_reroll(self):
         return self.rerolls < self.max_rerolls

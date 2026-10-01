@@ -145,11 +145,14 @@ in `checks` as `{check, status, detail}`.
 7. **Product specification.** From the authoritative production record
    only (Product Specification below): none → `PRODUCT_SPEC_BLOCK`;
    conflicting → `PRODUCT_SPEC_BLOCK` naming the conflict.
-8. **Model, quality, pricing.** Provider must offer high and medium
-   (`MODEL_OR_QUALITY_BLOCK`). A pricing snapshot for the provider, model,
-   both quality tiers and the image size must exist before any spend
-   (`PRICING_UNAVAILABLE`). The planned cost of the six images is computed
-   from it.
+8. **Provider, model, quality, pricing.** All read-only, no generation
+   call. Credentials must be present in the runtime environment; the
+   configured model must not be reported unavailable; the configured
+   capability record must list high and medium and the configured size. Any
+   failure → `MODEL_OR_QUALITY_BLOCK`; no model or tier is substituted. A
+   pricing snapshot for exactly this provider, model and size with both
+   tiers must exist (`PRICING_UNAVAILABLE` otherwise). The planned cost of
+   the six images is computed from it.
 9. **Budget.** Monthly recorded spend is read from the Render Expense Log
    (unreadable → `SOURCE_UNAVAILABLE`) and cross-checked against local cost
    logs for the month (the larger figure is used, with a warning). If the
@@ -222,10 +225,12 @@ call; if either cap would be exceeded the call is not made (`BUDGET_BLOCK`
 before the job, `STOPPED_BUDGET` during it). Spend is never reported after
 the fact.
 
-The pricing snapshot is a JSON file maintained by Jody for the configured
-provider and model, with `captured_at`, `basis`, `currency` and
-`per_image_usd` by quality and size. No snapshot, or no price for a needed
-tier, is `PRICING_UNAVAILABLE`; no per-image cost is ever guessed.
+The pricing snapshot is a JSON file maintained by Jody that identifies the
+provider, the exact configured model, the size, `captured_at`, `basis`,
+`currency` and `per_image_usd` by quality and size. A snapshot for a
+different model or size, or missing any of those, is invalid:
+`PRICING_UNAVAILABLE`. Stale pricing from another model is never reused and
+no per-image cost is ever guessed.
 
 The Render Expense Log is read, never written. The renderer writes
 `cost-log.json` locally and returns `proposed_expense_log_row` with the
@@ -253,26 +258,44 @@ The scene prompt (recorded per slot in the campaign manifest) describes the
 garment and environment only: the governed blank, provider and color with
 accurate construction; the slot's role; design concept, season and vibe as
 atmosphere words only; no text, logos, brand marks, labels or other graphics
-anywhere; and one perfectly flat, uniform, solid magenta rectangle on the
-chest print area that follows the fabric's shading and perspective. The
-approved artwork is never described for recreation.
+anywhere; and one flat, solid magenta rectangle on the chest print area
+whose outline follows the garment's perspective and drape, with plain
+continuous shirt around it. The approved artwork is never described for
+recreation.
 
-The compositor (`studio/compositor.py`, Pillow only, no model call):
+Two separate concerns, deliberately kept apart:
 
-1. finds the magenta print-area panel; none, too small, too large or not a
-   solid convex panel → the scene is unusable (reroll);
-2. derives cloth shading from the panel's brightness;
-3. replaces the panel with shaded fabric of the governed garment color;
-4. fits the art inside the panel preserving its aspect ratio exactly (never
-   stretched), maps it by a perspective transform and multiplies the cloth
-   shading into it; the art's alpha channel, if any, is used as-is;
-5. refuses to upscale: if the fitted width exceeds the art's width →
+- **A. Print-area geometry.** The magenta rectangle is a chroma marker used
+  only to locate the print-area quadrilateral. Its own pixel values are never
+  read for anything else. No marker, too small, too large, not a solid
+  convex panel, or touching the image edge → the scene is unusable (reroll).
+- **B. Garment appearance under the marker.** Reconstructed from the
+  surrounding shirt pixels by deterministic harmonic interpolation: the ring
+  of garment just outside the marker is the boundary condition, a Laplace
+  fill on a downsampled grid produces the smooth local luminance and color
+  field, and it is upsampled bilinearly under the marker. If the ring is not
+  believable garment (it contains chroma, is too small, or its luminance is
+  too inconsistent, as when the marker straddles the shirt edge and the
+  background) the scene is rejected and rerolled; the print region is never
+  flattened to a flat color.
+
+The compositor (`studio/compositor.py`, Pillow only, no model call) then:
+
+1. removes the marker completely, replacing it with the reconstructed garment
+   field;
+2. derives the shading map from the reconstructed field's luminance (white
+   outside the marker);
+3. fits the art inside the marker quad preserving its aspect ratio exactly
+   (never stretched), maps it by a perspective transform, multiplies the
+   shading into it, and alpha-composites it over the reconstructed garment;
+   the art's alpha channel, if any, is used as-is;
+4. refuses to upscale: if the fitted width exceeds the art's width →
    `RESOLUTION_BLOCK`;
-6. records the placement (quad, art quad, scale, rotation, shading method)
-   so QA can recompute the composite from the base scene, the source and the
-   placement and compare pixel-for-pixel.
+5. records the placement (marker quad, art quad, ring statistics, scale,
+   rotation, method) so QA can recompute the composite from the base scene,
+   the source and the placement and compare pixel-for-pixel.
 
-The generated base scene (with the placeholder) is kept beside each final
+The generated base scene (with the marker) is kept beside each final
 composite for audit.
 
 ## QA
@@ -281,9 +304,12 @@ Every final composite is checked before the campaign is considered
 successful. Deterministic checks, computed: image size; art identity
 (the final equals a fresh recomposite of base scene + approved source +
 recorded placement, so spelling, internal geometry and content are preserved
-by construction and any post-edit is caught); no upscale; aspect preserved;
-placement within bounds; no placeholder leak; single placement, no duplicate
-or ghost art; product specification consistent. Per image: `PASS` or
+by construction and any post-edit is caught); marker removed before
+placement (zero chroma pixels in the reconstructed base); no residual chroma
+leak (zero chroma pixels in the final where the marker was and the art does
+not cover); shading derived from the reconstruction, not the marker; no
+upscale; aspect preserved; placement within bounds; single placement, no
+duplicate or ghost art; product specification consistent. Per image: `PASS` or
 `BLOCKED` (→ `QA_FAILED`); an unusable scene is `REROLL`.
 
 Judgements that need eyes are never auto-passed: realistic shirt
@@ -346,6 +372,43 @@ Not authorisation: `Proceed`, `Do it`, `Render it`, `Yes`,
 `AUTHORIZE RENDER 1901-093`, `AUTHORIZE LISTING RENDER` (no id), prose
 around the command.
 
+## Provider Configuration and Preflight
+
+The image model is never hard-coded. Production configuration (no secrets)
+lives at `/home/claude/.config/1901-listing-studio/provider.json`:
+
+```json
+{
+  "provider": "openai",
+  "model": "<the configured image model id, verified current in the provider's docs>",
+  "size": "1024x1024",
+  "capabilities": { "qualities": ["low", "medium", "high"], "sizes": ["1024x1024", "1536x1024", "1024x1536"],
+                    "basis": "<docs URL and date where these capabilities were verified>" },
+  "pricing_path": "/home/claude/.config/1901-listing-studio/pricing.json"
+}
+```
+
+Credentials come only from the runtime environment (`OPENAI_API_KEY` for
+the OpenAI adapter), read at call time, never stored, printed or logged, and
+never committed. The adapter verifies at runtime, without any paid call,
+that credentials are present, that the configured model is available to
+them (a free model-metadata request), and that the configured capability
+record lists both governed quality tiers and the configured size. Anything
+missing → `MODEL_OR_QUALITY_BLOCK`; no other model or tier is ever chosen
+silently. The exact configured model is recorded in the proposal
+(`rendering`), the campaign manifest, the cost log, the pricing snapshot
+and every usage record entry.
+
+Read-only preflight, no generation call, tells Walter where things stand:
+
+```bash
+cd /home/claude/agents/1901/1901-listing-studio && .venv/bin/python render.py preflight
+```
+
+It reports: provider configured, model configured, credentials available
+(yes/no only), model available, quality tiers available, size supported,
+pricing snapshot available and which model it is for.
+
 ## Running the Renderer
 
 The renderer and its provider adapter live in this skill's local clone
@@ -356,8 +419,8 @@ output object.
 
 ```bash
 cd /home/claude/agents/1901/1901-listing-studio
-.venv/bin/python render.py --design-id 1901-093 --evidence /path/evidence.json \
-  --message "<the user's message, verbatim>" --provider openai
+.venv/bin/python render.py run --design-id 1901-093 --evidence /path/evidence.json \
+  --message "<the user's message, verbatim>"
 ```
 
 `evidence.json`:
@@ -377,10 +440,9 @@ cd /home/claude/agents/1901/1901-listing-studio
 `monthly_recorded_usd` is the sum of this month's rows in the Render Expense
 Log, or `null` if the tab could not be read. `requires_transparency` is what
 the governing production record says (`null` if it says nothing).
-`--provider openai` uses the OpenAI Images API (`gpt-image-1`) with the key
-from the environment at call time, never stored or printed; if no key is
-present the renderer reports `MODEL_OR_QUALITY_BLOCK` and does nothing.
-`--provider mock` is for fixtures only and never for production.
+The provider and model come from the configuration file above; with no
+valid configuration the renderer reports `MODEL_OR_QUALITY_BLOCK` and does
+nothing. `--mock` is for fixtures only and never for production.
 
 ## Output
 
@@ -394,6 +456,7 @@ Return exactly one JSON object:
   "campaign": { "root": "/home/claude/agents/1901/shared/render-campaigns/", "design_folder": "", "manifest_path": "", "qa_path": "", "contact_sheet_path": "", "images": [] },
   "budget": { "per_listing_limit_usd": 2.0, "monthly_limit_usd": 25.0, "estimated_job_cost_usd": 0, "monthly_recorded_cost_usd": 0, "projected_monthly_cost_usd": 0, "budget_flag": "" },
   "verification": { "queue_verified": false, "human_approval_verified": false, "source_verified": false, "handoff_verified": false, "product_spec_verified": false, "pricing_verified": false, "budget_verified": false, "qa_passed": false, "campaign_verified": false },
+  "rendering": { "provider": "", "model": "", "size": "", "quality_mix": { "high": 2, "medium": 4 }, "mode": "composited_fidelity" },
   "authorization": { "received": false, "evidence": "" },
   "proposed_expense_log_row": {}, "warnings": [], "checks": [], "human_action_required": null
 }
@@ -522,6 +585,16 @@ Input: `Render the listing campaign for 1901-093.` Zero generation calls, no cam
   "qa_passed": false,
   "campaign_verified": false
  },
+ "rendering": {
+  "provider": "mock",
+  "model": "mock-image-1",
+  "size": "1024x1024",
+  "quality_mix": {
+   "high": 2,
+   "medium": 4
+  },
+  "mode": "composited_fidelity"
+ },
  "authorization": {
   "received": false,
   "evidence": ""
@@ -529,6 +602,7 @@ Input: `Render the listing campaign for 1901-093.` Zero generation calls, no cam
  "proposed_expense_log_row": {
   "design_id": "1901-093",
   "model": "mock/mock-image-1",
+  "size": "1024x1024",
   "quality_mix": {
    "high": 2,
    "medium": 4
@@ -538,6 +612,7 @@ Input: `Render the listing campaign for 1901-093.` Zero generation calls, no cam
   "pricing_snapshot": {
    "provider": "mock",
    "model": "mock-image-1",
+   "size": "1024x1024",
    "captured_at": "2026-10-01T00:00:00Z",
    "basis": "fixture pricing for tests",
    "currency": "USD",
@@ -610,12 +685,12 @@ Input: `Render the listing campaign for 1901-093.` Zero generation calls, no cam
   {
    "check": "model_quality",
    "status": "PASS",
-   "detail": "mock / mock-image-1 offers high and medium"
+   "detail": "mock / mock-image-1: credentials present, model verified available, high and medium at 1024x1024 per the configured capability record"
   },
   {
    "check": "pricing",
    "status": "PASS",
-   "detail": "mock / mock-image-1 captured 2026-10-01T00:00:00Z: high $0.2000, medium $0.0500 per 1024x1024 image (fixture pricing for tests)"
+   "detail": "mock / mock-image-1 / 1024x1024 captured 2026-10-01T00:00:00Z: high $0.2000, medium $0.0500 per image (fixture pricing for tests)"
   },
   {
    "check": "budget",
@@ -633,7 +708,7 @@ Input: `Render the listing campaign for 1901-093.` Zero generation calls, no cam
    "detail": "the current run does not contain the exact command AUTHORIZE LISTING RENDER 1901-093; ordinary requests and vague confirmations never authorize rendering"
   }
  ],
- "human_action_required": "No generation call made and no campaign files created. 1901-093 is eligible: source 1901-093-B.png (Drive id 1WloiO2PNmvIZHQWBsYyYjqDCQOlae6Ve, sha256 5211ed2ff15b…) staged at /home/claude/agents/1901/shared/render-handoffs/1901-093/source/1901-093-B.png; product Comfort Colors 1717 Garment-Dyed Heavyweight T-Shirt / Printify / Monster Digital / Pepper; six scenes (2 high, 4 medium) on mock/mock-image-1 at an estimated $0.6000, month $3.1000 → $3.7000; output /home/claude/agents/1901/shared/render-campaigns/1901-093. To authorize exactly this render job, send exactly: AUTHORIZE LISTING RENDER 1901-093"
+ "human_action_required": "No generation call made and no campaign files created. 1901-093 is eligible: source 1901-093-B.png (Drive id 1WloiO2PNmvIZHQWBsYyYjqDCQOlae6Ve, sha256 5211ed2ff15b…) staged at /home/claude/agents/1901/shared/render-handoffs/1901-093/source/1901-093-B.png; product Comfort Colors 1717 Garment-Dyed Heavyweight T-Shirt / Printify / Monster Digital / Pepper; six scenes (2 high, 4 medium) at 1024x1024 on mock / mock-image-1 at an estimated $0.6000, month $3.1000 → $3.7000; output /home/claude/agents/1901/shared/render-campaigns/1901-093. To authorize exactly this render job, send exactly: AUTHORIZE LISTING RENDER 1901-093"
 }
 ```
 
@@ -694,6 +769,16 @@ Input: `AUTHORIZE LISTING RENDER 1901-093`, in a new run. Six scenes, six determ
   "qa_passed": true,
   "campaign_verified": true
  },
+ "rendering": {
+  "provider": "mock",
+  "model": "mock-image-1",
+  "size": "1024x1024",
+  "quality_mix": {
+   "high": 2,
+   "medium": 4
+  },
+  "mode": "composited_fidelity"
+ },
  "authorization": {
   "received": true,
   "evidence": "AUTHORIZE LISTING RENDER 1901-093"
@@ -701,6 +786,7 @@ Input: `AUTHORIZE LISTING RENDER 1901-093`, in a new run. Six scenes, six determ
  "proposed_expense_log_row": {
   "design_id": "1901-093",
   "model": "mock/mock-image-1",
+  "size": "1024x1024",
   "quality_mix": {
    "high": 2,
    "medium": 4
@@ -710,6 +796,7 @@ Input: `AUTHORIZE LISTING RENDER 1901-093`, in a new run. Six scenes, six determ
   "pricing_snapshot": {
    "provider": "mock",
    "model": "mock-image-1",
+   "size": "1024x1024",
    "captured_at": "2026-10-01T00:00:00Z",
    "basis": "fixture pricing for tests",
    "currency": "USD",
@@ -731,6 +818,7 @@ Input: `AUTHORIZE LISTING RENDER 1901-093`, in a new run. Six scenes, six determ
   "usage_record": [
    {
     "slot": 1,
+    "model": "mock-image-1",
     "quality": "high",
     "size": "1024x1024",
     "estimated_cost_usd": 0.2,
@@ -745,6 +833,7 @@ Input: `AUTHORIZE LISTING RENDER 1901-093`, in a new run. Six scenes, six determ
    },
    {
     "slot": 2,
+    "model": "mock-image-1",
     "quality": "high",
     "size": "1024x1024",
     "estimated_cost_usd": 0.2,
@@ -759,6 +848,7 @@ Input: `AUTHORIZE LISTING RENDER 1901-093`, in a new run. Six scenes, six determ
    },
    {
     "slot": 3,
+    "model": "mock-image-1",
     "quality": "medium",
     "size": "1024x1024",
     "estimated_cost_usd": 0.05,
@@ -773,6 +863,7 @@ Input: `AUTHORIZE LISTING RENDER 1901-093`, in a new run. Six scenes, six determ
    },
    {
     "slot": 4,
+    "model": "mock-image-1",
     "quality": "medium",
     "size": "1024x1024",
     "estimated_cost_usd": 0.05,
@@ -787,6 +878,7 @@ Input: `AUTHORIZE LISTING RENDER 1901-093`, in a new run. Six scenes, six determ
    },
    {
     "slot": 5,
+    "model": "mock-image-1",
     "quality": "medium",
     "size": "1024x1024",
     "estimated_cost_usd": 0.05,
@@ -801,6 +893,7 @@ Input: `AUTHORIZE LISTING RENDER 1901-093`, in a new run. Six scenes, six determ
    },
    {
     "slot": 6,
+    "model": "mock-image-1",
     "quality": "medium",
     "size": "1024x1024",
     "estimated_cost_usd": 0.05,
@@ -865,12 +958,12 @@ Input: `AUTHORIZE LISTING RENDER 1901-093`, in a new run. Six scenes, six determ
   {
    "check": "model_quality",
    "status": "PASS",
-   "detail": "mock / mock-image-1 offers high and medium"
+   "detail": "mock / mock-image-1: credentials present, model verified available, high and medium at 1024x1024 per the configured capability record"
   },
   {
    "check": "pricing",
    "status": "PASS",
-   "detail": "mock / mock-image-1 captured 2026-10-01T00:00:00Z: high $0.2000, medium $0.0500 per 1024x1024 image (fixture pricing for tests)"
+   "detail": "mock / mock-image-1 / 1024x1024 captured 2026-10-01T00:00:00Z: high $0.2000, medium $0.0500 per image (fixture pricing for tests)"
   },
   {
    "check": "budget",
@@ -895,32 +988,32 @@ Input: `AUTHORIZE LISTING RENDER 1901-093`, in a new run. Six scenes, six determ
   {
    "check": "scene_1",
    "status": "PASS",
-   "detail": "hero_lifestyle (high) generated, composited at scale 0.2057, deterministic QA PASS"
+   "detail": "hero_lifestyle (high) generated, composited at scale 0.205, deterministic QA PASS"
   },
   {
    "check": "scene_2",
    "status": "PASS",
-   "detail": "secondary_lifestyle_story (high) generated, composited at scale 0.2343, deterministic QA PASS"
+   "detail": "secondary_lifestyle_story (high) generated, composited at scale 0.2336, deterministic QA PASS"
   },
   {
    "check": "scene_3",
    "status": "PASS",
-   "detail": "travel_packing (medium) generated, composited at scale 0.1471, deterministic QA PASS"
+   "detail": "travel_packing (medium) generated, composited at scale 0.1464, deterministic QA PASS"
   },
   {
    "check": "scene_4",
    "status": "PASS",
-   "detail": "editorial_flat_lay (medium) generated, composited at scale 0.25, deterministic QA PASS"
+   "detail": "editorial_flat_lay (medium) generated, composited at scale 0.2493, deterministic QA PASS"
   },
   {
    "check": "scene_5",
    "status": "PASS",
-   "detail": "folded_garment_detail (medium) generated, composited at scale 0.1757, deterministic QA PASS"
+   "detail": "folded_garment_detail (medium) generated, composited at scale 0.175, deterministic QA PASS"
   },
   {
    "check": "scene_6",
    "status": "PASS",
-   "detail": "product_construction_detail (medium) generated, composited at scale 0.1471, deterministic QA PASS"
+   "detail": "product_construction_detail (medium) generated, composited at scale 0.1464, deterministic QA PASS"
   },
   {
    "check": "manifest",
@@ -994,6 +1087,16 @@ Target `1901-093`; input `AUTHORIZE LISTING RENDER 1901-094`.
   "qa_passed": false,
   "campaign_verified": false
  },
+ "rendering": {
+  "provider": "mock",
+  "model": "mock-image-1",
+  "size": "1024x1024",
+  "quality_mix": {
+   "high": 2,
+   "medium": 4
+  },
+  "mode": "composited_fidelity"
+ },
  "authorization": {
   "received": false,
   "evidence": ""
@@ -1001,6 +1104,7 @@ Target `1901-093`; input `AUTHORIZE LISTING RENDER 1901-094`.
  "proposed_expense_log_row": {
   "design_id": "1901-093",
   "model": "mock/mock-image-1",
+  "size": "1024x1024",
   "quality_mix": {
    "high": 2,
    "medium": 4
@@ -1010,6 +1114,7 @@ Target `1901-093`; input `AUTHORIZE LISTING RENDER 1901-094`.
   "pricing_snapshot": {
    "provider": "mock",
    "model": "mock-image-1",
+   "size": "1024x1024",
    "captured_at": "2026-10-01T00:00:00Z",
    "basis": "fixture pricing for tests",
    "currency": "USD",
@@ -1082,12 +1187,12 @@ Target `1901-093`; input `AUTHORIZE LISTING RENDER 1901-094`.
   {
    "check": "model_quality",
    "status": "PASS",
-   "detail": "mock / mock-image-1 offers high and medium"
+   "detail": "mock / mock-image-1: credentials present, model verified available, high and medium at 1024x1024 per the configured capability record"
   },
   {
    "check": "pricing",
    "status": "PASS",
-   "detail": "mock / mock-image-1 captured 2026-10-01T00:00:00Z: high $0.2000, medium $0.0500 per 1024x1024 image (fixture pricing for tests)"
+   "detail": "mock / mock-image-1 / 1024x1024 captured 2026-10-01T00:00:00Z: high $0.2000, medium $0.0500 per image (fixture pricing for tests)"
   },
   {
    "check": "budget",
@@ -1105,7 +1210,7 @@ Target `1901-093`; input `AUTHORIZE LISTING RENDER 1901-094`.
    "detail": "the command names 1901-094, not the target 1901-093; it authorizes nothing in this run"
   }
  ],
- "human_action_required": "No generation call made and no campaign files created. 1901-093 is eligible: source 1901-093-B.png (Drive id 1WloiO2PNmvIZHQWBsYyYjqDCQOlae6Ve, sha256 5211ed2ff15b…) staged at /home/claude/agents/1901/shared/render-handoffs/1901-093/source/1901-093-B.png; product Comfort Colors 1717 Garment-Dyed Heavyweight T-Shirt / Printify / Monster Digital / Pepper; six scenes (2 high, 4 medium) on mock/mock-image-1 at an estimated $0.6000, month $3.1000 → $3.7000; output /home/claude/agents/1901/shared/render-campaigns/1901-093. To authorize exactly this render job, send exactly: AUTHORIZE LISTING RENDER 1901-093"
+ "human_action_required": "No generation call made and no campaign files created. 1901-093 is eligible: source 1901-093-B.png (Drive id 1WloiO2PNmvIZHQWBsYyYjqDCQOlae6Ve, sha256 5211ed2ff15b…) staged at /home/claude/agents/1901/shared/render-handoffs/1901-093/source/1901-093-B.png; product Comfort Colors 1717 Garment-Dyed Heavyweight T-Shirt / Printify / Monster Digital / Pepper; six scenes (2 high, 4 medium) at 1024x1024 on mock / mock-image-1 at an estimated $0.6000, month $3.1000 → $3.7000; output /home/claude/agents/1901/shared/render-campaigns/1901-093. To authorize exactly this render job, send exactly: AUTHORIZE LISTING RENDER 1901-093"
 }
 ```
 
@@ -1166,6 +1271,16 @@ Scene 2 came back with no usable print area; one reroll, counted and costed.
   "qa_passed": true,
   "campaign_verified": true
  },
+ "rendering": {
+  "provider": "mock",
+  "model": "mock-image-1",
+  "size": "1024x1024",
+  "quality_mix": {
+   "high": 2,
+   "medium": 4
+  },
+  "mode": "composited_fidelity"
+ },
  "authorization": {
   "received": true,
   "evidence": "AUTHORIZE LISTING RENDER 1901-093"
@@ -1173,6 +1288,7 @@ Scene 2 came back with no usable print area; one reroll, counted and costed.
  "proposed_expense_log_row": {
   "design_id": "1901-093",
   "model": "mock/mock-image-1",
+  "size": "1024x1024",
   "quality_mix": {
    "high": 2,
    "medium": 4
@@ -1182,6 +1298,7 @@ Scene 2 came back with no usable print area; one reroll, counted and costed.
   "pricing_snapshot": {
    "provider": "mock",
    "model": "mock-image-1",
+   "size": "1024x1024",
    "captured_at": "2026-10-01T00:00:00Z",
    "basis": "fixture pricing for tests",
    "currency": "USD",
@@ -1203,6 +1320,7 @@ Scene 2 came back with no usable print area; one reroll, counted and costed.
   "usage_record": [
    {
     "slot": 1,
+    "model": "mock-image-1",
     "quality": "high",
     "size": "1024x1024",
     "estimated_cost_usd": 0.2,
@@ -1217,6 +1335,7 @@ Scene 2 came back with no usable print area; one reroll, counted and costed.
    },
    {
     "slot": 2,
+    "model": "mock-image-1",
     "quality": "high",
     "size": "1024x1024",
     "estimated_cost_usd": 0.2,
@@ -1231,11 +1350,12 @@ Scene 2 came back with no usable print area; one reroll, counted and costed.
    },
    {
     "slot": 2,
+    "model": "mock-image-1",
     "quality": "high",
     "size": "1024x1024",
     "estimated_cost_usd": 0.2,
     "reroll": true,
-    "reason": "scene 2 unusable: no print-area placeholder found in the scene",
+    "reason": "scene 2 unusable: no print-area marker found in the scene",
     "usage": {
      "images": 1,
      "quality": "high",
@@ -1245,6 +1365,7 @@ Scene 2 came back with no usable print area; one reroll, counted and costed.
    },
    {
     "slot": 3,
+    "model": "mock-image-1",
     "quality": "medium",
     "size": "1024x1024",
     "estimated_cost_usd": 0.05,
@@ -1259,6 +1380,7 @@ Scene 2 came back with no usable print area; one reroll, counted and costed.
    },
    {
     "slot": 4,
+    "model": "mock-image-1",
     "quality": "medium",
     "size": "1024x1024",
     "estimated_cost_usd": 0.05,
@@ -1273,6 +1395,7 @@ Scene 2 came back with no usable print area; one reroll, counted and costed.
    },
    {
     "slot": 5,
+    "model": "mock-image-1",
     "quality": "medium",
     "size": "1024x1024",
     "estimated_cost_usd": 0.05,
@@ -1287,6 +1410,7 @@ Scene 2 came back with no usable print area; one reroll, counted and costed.
    },
    {
     "slot": 6,
+    "model": "mock-image-1",
     "quality": "medium",
     "size": "1024x1024",
     "estimated_cost_usd": 0.05,
@@ -1351,12 +1475,12 @@ Scene 2 came back with no usable print area; one reroll, counted and costed.
   {
    "check": "model_quality",
    "status": "PASS",
-   "detail": "mock / mock-image-1 offers high and medium"
+   "detail": "mock / mock-image-1: credentials present, model verified available, high and medium at 1024x1024 per the configured capability record"
   },
   {
    "check": "pricing",
    "status": "PASS",
-   "detail": "mock / mock-image-1 captured 2026-10-01T00:00:00Z: high $0.2000, medium $0.0500 per 1024x1024 image (fixture pricing for tests)"
+   "detail": "mock / mock-image-1 / 1024x1024 captured 2026-10-01T00:00:00Z: high $0.2000, medium $0.0500 per image (fixture pricing for tests)"
   },
   {
    "check": "budget",
@@ -1381,37 +1505,37 @@ Scene 2 came back with no usable print area; one reroll, counted and costed.
   {
    "check": "scene_1",
    "status": "PASS",
-   "detail": "hero_lifestyle (high) generated, composited at scale 0.2057, deterministic QA PASS"
+   "detail": "hero_lifestyle (high) generated, composited at scale 0.205, deterministic QA PASS"
   },
   {
    "check": "scene_2",
    "status": "INFO",
-   "detail": "attempt 1 rejected (no print-area placeholder found in the scene); one controlled reroll (reroll 1 of 4); the art is never distorted to fit a bad scene"
+   "detail": "attempt 1 rejected (no print-area marker found in the scene); one controlled reroll (reroll 1 of 4); the art is never distorted to fit a bad scene"
   },
   {
    "check": "scene_2",
    "status": "PASS",
-   "detail": "secondary_lifestyle_story (high) generated, composited at scale 0.2343, deterministic QA PASS after 1 reroll(s)"
+   "detail": "secondary_lifestyle_story (high) generated, composited at scale 0.2336, deterministic QA PASS after 1 reroll(s)"
   },
   {
    "check": "scene_3",
    "status": "PASS",
-   "detail": "travel_packing (medium) generated, composited at scale 0.1471, deterministic QA PASS"
+   "detail": "travel_packing (medium) generated, composited at scale 0.1464, deterministic QA PASS"
   },
   {
    "check": "scene_4",
    "status": "PASS",
-   "detail": "editorial_flat_lay (medium) generated, composited at scale 0.25, deterministic QA PASS"
+   "detail": "editorial_flat_lay (medium) generated, composited at scale 0.2493, deterministic QA PASS"
   },
   {
    "check": "scene_5",
    "status": "PASS",
-   "detail": "folded_garment_detail (medium) generated, composited at scale 0.1757, deterministic QA PASS"
+   "detail": "folded_garment_detail (medium) generated, composited at scale 0.175, deterministic QA PASS"
   },
   {
    "check": "scene_6",
    "status": "PASS",
-   "detail": "product_construction_detail (medium) generated, composited at scale 0.1471, deterministic QA PASS"
+   "detail": "product_construction_detail (medium) generated, composited at scale 0.1464, deterministic QA PASS"
   },
   {
    "check": "manifest",
@@ -1478,6 +1602,16 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
   "qa_passed": false,
   "campaign_verified": false
  },
+ "rendering": {
+  "provider": "mock",
+  "model": "mock-image-1",
+  "size": "1024x1024",
+  "quality_mix": {
+   "high": 2,
+   "medium": 4
+  },
+  "mode": "composited_fidelity"
+ },
  "authorization": {
   "received": true,
   "evidence": "AUTHORIZE LISTING RENDER 1901-093"
@@ -1485,6 +1619,7 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
  "proposed_expense_log_row": {
   "design_id": "1901-093",
   "model": "mock/mock-image-1",
+  "size": "1024x1024",
   "quality_mix": {
    "high": 2,
    "medium": 4
@@ -1494,6 +1629,7 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
   "pricing_snapshot": {
    "provider": "mock",
    "model": "mock-image-1",
+   "size": "1024x1024",
    "captured_at": "2026-10-01T00:00:00Z",
    "basis": "fixture pricing for tests",
    "currency": "USD",
@@ -1515,6 +1651,7 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
   "usage_record": [
    {
     "slot": 1,
+    "model": "mock-image-1",
     "quality": "high",
     "size": "1024x1024",
     "estimated_cost_usd": 0.2,
@@ -1529,6 +1666,7 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
    },
    {
     "slot": 2,
+    "model": "mock-image-1",
     "quality": "high",
     "size": "1024x1024",
     "estimated_cost_usd": 0.2,
@@ -1543,11 +1681,12 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
    },
    {
     "slot": 2,
+    "model": "mock-image-1",
     "quality": "high",
     "size": "1024x1024",
     "estimated_cost_usd": 0.2,
     "reroll": true,
-    "reason": "scene 2 unusable: no print-area placeholder found in the scene",
+    "reason": "scene 2 unusable: no print-area marker found in the scene",
     "usage": {
      "images": 1,
      "quality": "high",
@@ -1607,12 +1746,12 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
   {
    "check": "model_quality",
    "status": "PASS",
-   "detail": "mock / mock-image-1 offers high and medium"
+   "detail": "mock / mock-image-1: credentials present, model verified available, high and medium at 1024x1024 per the configured capability record"
   },
   {
    "check": "pricing",
    "status": "PASS",
-   "detail": "mock / mock-image-1 captured 2026-10-01T00:00:00Z: high $0.2000, medium $0.0500 per 1024x1024 image (fixture pricing for tests)"
+   "detail": "mock / mock-image-1 / 1024x1024 captured 2026-10-01T00:00:00Z: high $0.2000, medium $0.0500 per image (fixture pricing for tests)"
   },
   {
    "check": "budget",
@@ -1637,17 +1776,17 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
   {
    "check": "scene_1",
    "status": "PASS",
-   "detail": "hero_lifestyle (high) generated, composited at scale 0.2057, deterministic QA PASS"
+   "detail": "hero_lifestyle (high) generated, composited at scale 0.205, deterministic QA PASS"
   },
   {
    "check": "scene_2",
    "status": "INFO",
-   "detail": "attempt 1 rejected (no print-area placeholder found in the scene); one controlled reroll (reroll 1 of 4); the art is never distorted to fit a bad scene"
+   "detail": "attempt 1 rejected (no print-area marker found in the scene); one controlled reroll (reroll 1 of 4); the art is never distorted to fit a bad scene"
   },
   {
    "check": "scene_2",
    "status": "PASS",
-   "detail": "secondary_lifestyle_story (high) generated, composited at scale 0.2343, deterministic QA PASS after 1 reroll(s)"
+   "detail": "secondary_lifestyle_story (high) generated, composited at scale 0.2336, deterministic QA PASS after 1 reroll(s)"
   },
   {
    "check": "budget",
@@ -1719,6 +1858,16 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
   "qa_passed": true,
   "campaign_verified": true
  },
+ "rendering": {
+  "provider": "mock",
+  "model": "mock-image-1",
+  "size": "1024x1024",
+  "quality_mix": {
+   "high": 2,
+   "medium": 4
+  },
+  "mode": "composited_fidelity"
+ },
  "authorization": {
   "received": false,
   "evidence": ""
@@ -1769,12 +1918,12 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
   {
    "check": "model_quality",
    "status": "PASS",
-   "detail": "mock / mock-image-1 offers high and medium"
+   "detail": "mock / mock-image-1: credentials present, model verified available, high and medium at 1024x1024 per the configured capability record"
   },
   {
    "check": "pricing",
    "status": "PASS",
-   "detail": "mock / mock-image-1 captured 2026-10-01T00:00:00Z: high $0.2000, medium $0.0500 per 1024x1024 image (fixture pricing for tests)"
+   "detail": "mock / mock-image-1 / 1024x1024 captured 2026-10-01T00:00:00Z: high $0.2000, medium $0.0500 per image (fixture pricing for tests)"
   },
   {
    "check": "budget",
@@ -1839,6 +1988,16 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
   "qa_passed": false,
   "campaign_verified": false
  },
+ "rendering": {
+  "provider": "mock",
+  "model": "mock-image-1",
+  "size": "1024x1024",
+  "quality_mix": {
+   "high": 2,
+   "medium": 4
+  },
+  "mode": "composited_fidelity"
+ },
  "authorization": {
   "received": false,
   "evidence": ""
@@ -1889,12 +2048,12 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
   {
    "check": "model_quality",
    "status": "PASS",
-   "detail": "mock / mock-image-1 offers high and medium"
+   "detail": "mock / mock-image-1: credentials present, model verified available, high and medium at 1024x1024 per the configured capability record"
   },
   {
    "check": "pricing",
    "status": "PASS",
-   "detail": "mock / mock-image-1 captured 2026-10-01T00:00:00Z: high $0.2000, medium $0.0500 per 1024x1024 image (fixture pricing for tests)"
+   "detail": "mock / mock-image-1 / 1024x1024 captured 2026-10-01T00:00:00Z: high $0.2000, medium $0.0500 per image (fixture pricing for tests)"
   },
   {
    "check": "budget",
@@ -1958,6 +2117,16 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
   "budget_verified": false,
   "qa_passed": false,
   "campaign_verified": false
+ },
+ "rendering": {
+  "provider": "mock",
+  "model": "mock-image-1",
+  "size": "1024x1024",
+  "quality_mix": {
+   "high": 2,
+   "medium": 4
+  },
+  "mode": "composited_fidelity"
  },
  "authorization": {
   "received": false,
@@ -2059,6 +2228,16 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
   "qa_passed": false,
   "campaign_verified": false
  },
+ "rendering": {
+  "provider": "mock",
+  "model": "mock-image-1",
+  "size": "1024x1024",
+  "quality_mix": {
+   "high": 2,
+   "medium": 4
+  },
+  "mode": "composited_fidelity"
+ },
  "authorization": {
   "received": false,
   "evidence": ""
@@ -2159,6 +2338,16 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
   "qa_passed": false,
   "campaign_verified": false
  },
+ "rendering": {
+  "provider": "mock",
+  "model": "mock-image-1",
+  "size": "1024x1024",
+  "quality_mix": {
+   "high": 2,
+   "medium": 4
+  },
+  "mode": "composited_fidelity"
+ },
  "authorization": {
   "received": false,
   "evidence": ""
@@ -2209,12 +2398,12 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
   {
    "check": "model_quality",
    "status": "PASS",
-   "detail": "mock / mock-image-1 offers high and medium"
+   "detail": "mock / mock-image-1: credentials present, model verified available, high and medium at 1024x1024 per the configured capability record"
   },
   {
    "check": "pricing",
    "status": "PASS",
-   "detail": "mock / mock-image-1 captured 2026-10-01T00:00:00Z: high $2.5000, medium $0.0500 per 1024x1024 image (fixture pricing for tests)"
+   "detail": "mock / mock-image-1 / 1024x1024 captured 2026-10-01T00:00:00Z: high $2.5000, medium $0.0500 per image (fixture pricing for tests)"
   },
   {
    "check": "budget",
@@ -2273,6 +2462,16 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
   "budget_verified": false,
   "qa_passed": false,
   "campaign_verified": false
+ },
+ "rendering": {
+  "provider": "mock",
+  "model": "mock-image-1",
+  "size": "1024x1024",
+  "quality_mix": {
+   "high": 2,
+   "medium": 4
+  },
+  "mode": "composited_fidelity"
  },
  "authorization": {
   "received": false,
@@ -2368,6 +2567,16 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
   "budget_verified": false,
   "qa_passed": false,
   "campaign_verified": false
+ },
+ "rendering": {
+  "provider": "mock",
+  "model": "mock-image-1",
+  "size": "1024x1024",
+  "quality_mix": {
+   "high": 2,
+   "medium": 4
+  },
+  "mode": "composited_fidelity"
  },
  "authorization": {
   "received": false,
@@ -2466,6 +2675,16 @@ The hero composite was modified after compositing (simulated re-lettering); the 
   "qa_passed": false,
   "campaign_verified": false
  },
+ "rendering": {
+  "provider": "mock",
+  "model": "mock-image-1",
+  "size": "1024x1024",
+  "quality_mix": {
+   "high": 2,
+   "medium": 4
+  },
+  "mode": "composited_fidelity"
+ },
  "authorization": {
   "received": true,
   "evidence": "AUTHORIZE LISTING RENDER 1901-093"
@@ -2473,6 +2692,7 @@ The hero composite was modified after compositing (simulated re-lettering); the 
  "proposed_expense_log_row": {
   "design_id": "1901-093",
   "model": "mock/mock-image-1",
+  "size": "1024x1024",
   "quality_mix": {
    "high": 2,
    "medium": 4
@@ -2482,6 +2702,7 @@ The hero composite was modified after compositing (simulated re-lettering); the 
   "pricing_snapshot": {
    "provider": "mock",
    "model": "mock-image-1",
+   "size": "1024x1024",
    "captured_at": "2026-10-01T00:00:00Z",
    "basis": "fixture pricing for tests",
    "currency": "USD",
@@ -2503,6 +2724,7 @@ The hero composite was modified after compositing (simulated re-lettering); the 
   "usage_record": [
    {
     "slot": 1,
+    "model": "mock-image-1",
     "quality": "high",
     "size": "1024x1024",
     "estimated_cost_usd": 0.2,
@@ -2567,12 +2789,12 @@ The hero composite was modified after compositing (simulated re-lettering); the 
   {
    "check": "model_quality",
    "status": "PASS",
-   "detail": "mock / mock-image-1 offers high and medium"
+   "detail": "mock / mock-image-1: credentials present, model verified available, high and medium at 1024x1024 per the configured capability record"
   },
   {
    "check": "pricing",
    "status": "PASS",
-   "detail": "mock / mock-image-1 captured 2026-10-01T00:00:00Z: high $0.2000, medium $0.0500 per 1024x1024 image (fixture pricing for tests)"
+   "detail": "mock / mock-image-1 / 1024x1024 captured 2026-10-01T00:00:00Z: high $0.2000, medium $0.0500 per image (fixture pricing for tests)"
   },
   {
    "check": "budget",
@@ -2609,6 +2831,212 @@ The hero composite was modified after compositing (simulated re-lettering); the 
 }
 ```
 
+### N. Residual chroma leak: QA_FAILED
+
+The reconstructed base still held marker pixels (simulated); deterministic QA refused the image.
+
+```json
+{
+ "design_id": "1901-093",
+ "result": "QA_FAILED",
+ "render_performed": false,
+ "render_job_id": "fixture001",
+ "timestamp": "2026-10-01T02:00:00Z",
+ "source": {
+  "drive_file_id": "1WloiO2PNmvIZHQWBsYyYjqDCQOlae6Ve",
+  "filename": "1901-093-B.png",
+  "sha256": "5211ed2ff15b370ae478caafe34bb2d55abb60a4fdd8f79521af2a8d416f2916",
+  "staged_path": "/home/claude/agents/1901/shared/render-handoffs/1901-093/source/1901-093-B.png"
+ },
+ "product": {
+  "blank": "Comfort Colors 1717 Garment-Dyed Heavyweight T-Shirt",
+  "provider": "Printify / Monster Digital",
+  "color": "Pepper",
+  "spec_source": "Idea Queue row 95 + 01 — 1901 Listing Render System (CURRENT) §Product"
+ },
+ "campaign": {
+  "root": "/home/claude/agents/1901/shared/render-campaigns/",
+  "design_folder": "",
+  "manifest_path": "",
+  "qa_path": "",
+  "contact_sheet_path": "",
+  "images": []
+ },
+ "budget": {
+  "per_listing_limit_usd": 2.0,
+  "monthly_limit_usd": 25.0,
+  "estimated_job_cost_usd": 0.2,
+  "monthly_recorded_cost_usd": 3.1,
+  "projected_monthly_cost_usd": 3.3,
+  "budget_flag": "OK"
+ },
+ "verification": {
+  "queue_verified": true,
+  "human_approval_verified": true,
+  "source_verified": true,
+  "handoff_verified": true,
+  "product_spec_verified": true,
+  "pricing_verified": true,
+  "budget_verified": true,
+  "qa_passed": false,
+  "campaign_verified": false
+ },
+ "rendering": {
+  "provider": "mock",
+  "model": "mock-image-1",
+  "size": "1024x1024",
+  "quality_mix": {
+   "high": 2,
+   "medium": 4
+  },
+  "mode": "composited_fidelity"
+ },
+ "authorization": {
+  "received": true,
+  "evidence": "AUTHORIZE LISTING RENDER 1901-093"
+ },
+ "proposed_expense_log_row": {
+  "design_id": "1901-093",
+  "model": "mock/mock-image-1",
+  "size": "1024x1024",
+  "quality_mix": {
+   "high": 2,
+   "medium": 4
+  },
+  "source_drive_id": "1WloiO2PNmvIZHQWBsYyYjqDCQOlae6Ve",
+  "source_sha256": "5211ed2ff15b370ae478caafe34bb2d55abb60a4fdd8f79521af2a8d416f2916",
+  "pricing_snapshot": {
+   "provider": "mock",
+   "model": "mock-image-1",
+   "size": "1024x1024",
+   "captured_at": "2026-10-01T00:00:00Z",
+   "basis": "fixture pricing for tests",
+   "currency": "USD",
+   "per_image_usd": {
+    "high": {
+     "1024x1024": 0.2
+    },
+    "medium": {
+     "1024x1024": 0.05
+    }
+   }
+  },
+  "campaign_folder": "/home/claude/agents/1901/shared/render-campaigns/1901-093",
+  "render_job_id": "fixture001",
+  "started_at": "2026-10-01T02:00:00Z",
+  "completed_at": "2026-10-01T02:00:00Z",
+  "images_generated": 1,
+  "rerolls": 0,
+  "usage_record": [
+   {
+    "slot": 1,
+    "model": "mock-image-1",
+    "quality": "high",
+    "size": "1024x1024",
+    "estimated_cost_usd": 0.2,
+    "reroll": false,
+    "reason": "",
+    "usage": {
+     "images": 1,
+     "quality": "high",
+     "size": "1024x1024",
+     "mock": true
+    }
+   }
+  ],
+  "estimated_api_cost_usd": 0.2,
+  "job_status": "FAILED:QA_FAILED",
+  "budget_flag": "OK",
+  "notes": [],
+  "actual_billed_cost_usd": null
+ },
+ "warnings": [],
+ "checks": [
+  {
+   "check": "input",
+   "status": "PASS",
+   "detail": "design_id '1901-093' (trimmed)"
+  },
+  {
+   "check": "queue_read",
+   "status": "PASS",
+   "detail": "exactly one row (sheet row 95) carries id 1901-093"
+  },
+  {
+   "check": "human_approval",
+   "status": "PASS",
+   "detail": "human_decision is exactly APPROVE and status is exactly Approved"
+  },
+  {
+   "check": "source_identity",
+   "status": "PASS",
+   "detail": "render_source_path and the resolver name the same Drive file 1WloiO2PNmvIZHQWBsYyYjqDCQOlae6Ve"
+  },
+  {
+   "check": "governance",
+   "status": "PASS",
+   "detail": "1901-prepare-production-handoff reports no unresolved blocker for this design"
+  },
+  {
+   "check": "staged_handoff",
+   "status": "PASS",
+   "detail": "handoff valid: manifest, authority, integrity and SHA-256 all verified"
+  },
+  {
+   "check": "source_image",
+   "status": "PASS",
+   "detail": "1400x1000px, bands RGBA, alpha=yes"
+  },
+  {
+   "check": "product_spec",
+   "status": "PASS",
+   "detail": "Comfort Colors 1717 Garment-Dyed Heavyweight T-Shirt / Printify / Monster Digital / Pepper from Idea Queue row 95 + 01 — 1901 Listing Render System (CURRENT) §Product"
+  },
+  {
+   "check": "model_quality",
+   "status": "PASS",
+   "detail": "mock / mock-image-1: credentials present, model verified available, high and medium at 1024x1024 per the configured capability record"
+  },
+  {
+   "check": "pricing",
+   "status": "PASS",
+   "detail": "mock / mock-image-1 / 1024x1024 captured 2026-10-01T00:00:00Z: high $0.2000, medium $0.0500 per image (fixture pricing for tests)"
+  },
+  {
+   "check": "budget",
+   "status": "PASS",
+   "detail": "planned campaign $0.6000 ≤ $2.00; month $3.1000 → $3.7000 ≤ $25.00"
+  },
+  {
+   "check": "existing_campaign",
+   "status": "PASS",
+   "detail": "no campaign folder exists for this design"
+  },
+  {
+   "check": "authorization",
+   "status": "PASS",
+   "detail": "current run contains the exact command: AUTHORIZE LISTING RENDER 1901-093"
+  },
+  {
+   "check": "source_copy",
+   "status": "PASS",
+   "detail": "exact source bytes, the handoff manifest and source-reference.json recorded in the job"
+  },
+  {
+   "check": "scene_1",
+   "status": "FAIL",
+   "detail": "deterministic QA: marker_removed_before_placement 169 marker pixels remain in the reconstructed base; no_residual_chroma_leak 169 chroma pixels remain where the marker was and the art does not cover"
+  },
+  {
+   "check": "failed_job",
+   "status": "INFO",
+   "detail": "job artifacts kept for diagnosis at /home/claude/agents/1901/shared/render-campaigns/_failed/1901-093-fixture001; no downstream-ready flag; no final campaign folder created"
+  }
+ ],
+ "human_action_required": "Scene 1 for 1901-093 failed deterministic QA; the campaign was not published. Review the failed job artifacts."
+}
+```
+
 ## Verification
 
 The skill worked if the reply is one JSON object in the shape above; no
@@ -2629,17 +3057,19 @@ touched.
   `/home/claude/agents/1901/1901-listing-studio/`. Keep the clone at the
   imported commit. Pillow is installed in that folder's own virtualenv, not
   system-wide.
-- No image provider is configured on the VPS today. The OpenAI adapter
-  exists and is untested live; configuring a key is a credential decision
-  for Jody. Until then every authorised run ends in
-  `MODEL_OR_QUALITY_BLOCK` after the read-only checks, with no spend.
-- The pricing snapshot file does not exist yet; until Jody records one,
-  runs end in `PRICING_UNAVAILABLE`.
+- No provider configuration, credential, or pricing snapshot exists on the
+  VPS today. The OpenAI adapter exists and is untested live. Until Jody
+  writes `provider.json` (choosing a current image model and recording its
+  capabilities), provides a key in Walter's environment, and records a
+  pricing snapshot for exactly that model and size, every authorised run
+  ends in `MODEL_OR_QUALITY_BLOCK` or `PRICING_UNAVAILABLE` after the
+  read-only checks, with no spend.
 - Walter still has no Sheets or Drive connector, so the live checks that
   depend on the other skills return `SOURCE_UNAVAILABLE` until access is
   granted.
 - Print-area detection relies on the scene model honouring the magenta
-  placeholder instruction. Scenes that do not are rejected and rerolled,
+  marker instruction, and garment reconstruction relies on plain shirt
+  around it. Scenes that do not provide either are rejected and rerolled,
   never patched.
 - Scene-content judgements (fake text, logos, construction realism) are
   listed for human review, not auto-passed; the deterministic QA proves the

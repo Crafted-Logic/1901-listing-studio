@@ -1,93 +1,157 @@
 """Image-generation provider adapter. Business logic never touches a provider directly.
 
-provider.generate_scene(prompt, quality, size, metadata) -> {"png": bytes, "usage": {...}, "model": str, "quality": str, "size": str}
-provider.supports_quality(quality) -> bool
-provider.pricing_snapshot() -> dict | None   (see pricing.py for the shape)
+Production configuration (no secrets) lives at config.PROVIDER_CONFIG_PATH:
+{
+  "provider": "openai",
+  "model": "<the configured image model id>",
+  "size": "1024x1024",
+  "capabilities": {"qualities": ["low", "medium", "high"], "sizes": ["1024x1024", "1536x1024", "1024x1536"],
+                   "basis": "where these capabilities were verified (docs URL + date)"},
+  "pricing_path": "/home/claude/.config/1901-listing-studio/pricing.json"
+}
+The model is never hard-coded. Credentials come only from the runtime environment (OPENAI_API_KEY)
+and are never stored, printed or logged.
+
+provider.generate_scene(prompt, quality, size, metadata) -> {"png", "usage", "model", "quality", "size"}
+provider.supports_quality(q) / supports_size(s) -> bool      (from the configured capability record)
+provider.credentials_available() -> bool
+provider.model_available() -> True | False | None            (None = could not be checked; no paid call)
+provider.pricing_snapshot() -> dict | None
+provider.preflight() -> dict                                  (read-only, no generation call)
 """
-import base64, io, json, os, urllib.request
+import base64, io, json, os, urllib.error, urllib.request
 from PIL import Image, ImageDraw
 
 from . import config, pricing
 
 
+def load_provider_config(path=None):
+    path = path or config.PROVIDER_CONFIG_PATH
+    if not os.path.isfile(path):
+        return None
+    try:
+        cfg = json.load(open(path, encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(cfg, dict) or not cfg.get("provider") or not cfg.get("model"):
+        return None
+    cfg.setdefault("size", config.IMAGE_SIZE); cfg.setdefault("capabilities", {}); cfg.setdefault("pricing_path", config.PRICING_PATH)
+    return cfg
+
+
 class Provider:
-    name = "abstract"
-    model = ""
+    name = "abstract"; model = ""; size = config.IMAGE_SIZE
     def supports_quality(self, quality): return False
+    def supports_size(self, size): return False
+    def credentials_available(self): return False
+    def model_available(self): return None
     def pricing_snapshot(self): return None
     def generate_scene(self, prompt, quality, size, metadata): raise NotImplementedError
+    def preflight(self):
+        snap = self.pricing_snapshot()
+        return {"provider_configured": True, "provider": self.name, "model_configured": self.model, "size": self.size,
+                "credentials_available": self.credentials_available(), "model_available": self.model_available(),
+                "quality_tiers_available": {q: self.supports_quality(q) for q in config.QUALITY_MIX}, "size_supported": self.supports_size(self.size),
+                "pricing_snapshot_available": snap is not None, "pricing_snapshot": {k: snap.get(k) for k in ("provider", "model", "size", "captured_at", "basis", "currency")} if snap else None,
+                "generation_call_made": False}
 
 
 class MockProvider(Provider):
-    """Draws a synthetic garment scene with the magenta print-area placeholder. `script` is a list of
-    per-call behaviours: "ok", "no_placeholder" (unusable geometry), "tiny" (placeholder too small),
-    "error" (raise). Calls beyond the script are "ok". Nothing leaves the process; cost is fixture."""
+    """Draws a synthetic garment scene with real shading and a UNIFORM chroma marker (the marker carries
+    no shading information). `script` lists per-call behaviours: "ok", "no_marker", "tiny", "edge"
+    (marker straddling the shirt edge: ring inconsistent), "error". Beyond the script: "ok".
+    marker_pattern "uniform" | "noisy" controls the marker's own pixel values (for the test proving
+    shading does not depend on them)."""
     name = "mock"
-    model = "mock-image-1"
 
-    def __init__(self, pricing_snapshot=None, qualities=("high", "medium"), script=None):
-        self._pricing = pricing_snapshot
-        self._qualities = set(qualities)
-        self.script = list(script or [])
-        self.calls = []
+    def __init__(self, pricing_snapshot=None, qualities=("high", "medium"), script=None, model="mock-image-1", size=config.IMAGE_SIZE, sizes=None, credentials=True, available=True, marker_pattern="uniform"):
+        self._pricing = pricing_snapshot; self._qualities = set(qualities); self.script = list(script or []); self.model = model; self.size = size
+        self._sizes = set(sizes or [size]); self._credentials = credentials; self._available = available; self.marker_pattern = marker_pattern; self.calls = []
 
     def supports_quality(self, quality): return quality in self._qualities
-    def pricing_snapshot(self): return self._pricing
+    def supports_size(self, size): return size in self._sizes
+    def credentials_available(self): return self._credentials
+    def model_available(self): return self._available
+    def pricing_snapshot(self): return self._pricing if self._pricing and pricing.validate(self._pricing, self.name, self.model, self.size) else None
 
     def generate_scene(self, prompt, quality, size, metadata):
         behaviour = self.script.pop(0) if self.script else "ok"
-        self.calls.append({"prompt": prompt, "quality": quality, "size": size, "metadata": metadata, "behaviour": behaviour})
-        if behaviour == "error":
-            raise RuntimeError("mock provider: generation error")
-        w, h = (int(x) for x in size.split("x"))
-        img = Image.new("RGB", (w, h), (214, 206, 194))
-        d = ImageDraw.Draw(img)
-        color = tuple(metadata.get("garment_rgb", (40, 44, 52)))
-        d.polygon([(w * 0.25, h * 0.2), (w * 0.75, h * 0.2), (w * 0.85, h * 0.35), (w * 0.72, h * 0.4), (w * 0.72, h * 0.9), (w * 0.28, h * 0.9), (w * 0.28, h * 0.4), (w * 0.15, h * 0.35)], fill=color)
-        slot = metadata.get("slot", 1)
-        if behaviour == "ok":
-            q = {1: (0.36, 0.38, 0.64, 0.66), 2: (0.34, 0.40, 0.66, 0.70), 3: (0.40, 0.45, 0.60, 0.65), 4: (0.33, 0.36, 0.67, 0.68), 5: (0.38, 0.42, 0.62, 0.66), 6: (0.44, 0.5, 0.64, 0.7)}[slot]
-            x0, y0, x1, y1 = (q[0] * w, q[1] * h, q[2] * w, q[3] * h)
-            for i in range(int(y0), int(y1)):                       # shaded placeholder: darker toward the bottom (cloth shading)
-                t = (i - y0) / max(1, (y1 - y0))
-                shade = int(255 - 90 * t)
-                d.line([(x0, i), (x1, i)], fill=(shade, 0, shade))
-        elif behaviour == "tiny":
-            d.rectangle([w * 0.49, h * 0.49, w * 0.52, h * 0.52], fill=config.PLACEHOLDER_RGB)
-        # "no_placeholder": garment only, nothing to composite into
-        buf = io.BytesIO(); img.save(buf, format="PNG")
+        self.calls.append({"prompt": prompt, "quality": quality, "size": size, "metadata": metadata, "behaviour": behaviour, "model": self.model})
+        if behaviour == "error": raise RuntimeError("mock provider: generation error")
+        buf = io.BytesIO(); draw_scene(size, metadata.get("garment_rgb", (40, 44, 52)), metadata.get("slot", 1), behaviour, self.marker_pattern).save(buf, format="PNG")
         return {"png": buf.getvalue(), "usage": {"images": 1, "quality": quality, "size": size, "mock": True}, "model": self.model, "quality": quality, "size": size}
 
 
+def draw_scene(size, color, slot, behaviour="ok", marker_pattern="uniform"):
+    w, h = (int(x) for x in size.split("x"))
+    img = Image.new("RGB", (w, h), (214, 206, 194)); d = ImageDraw.Draw(img)
+    shirt = [(w * 0.25, h * 0.2), (w * 0.75, h * 0.2), (w * 0.85, h * 0.35), (w * 0.72, h * 0.4), (w * 0.72, h * 0.9), (w * 0.28, h * 0.9), (w * 0.28, h * 0.4), (w * 0.15, h * 0.35)]
+    # garment with real shading: vertical falloff plus a diagonal fold highlight
+    for y in range(int(h * 0.2), int(h * 0.9)):
+        t = (y - h * 0.2) / (h * 0.7); k = 1.15 - 0.45 * t
+        d.line([(0, y), (w, y)], fill=tuple(max(0, min(255, int(c * k))) for c in color))
+    shirt_mask = Image.new("L", (w, h), 0); ImageDraw.Draw(shirt_mask).polygon(shirt, fill=255)
+    bg = Image.new("RGB", (w, h), (214, 206, 194)); img = Image.composite(img, bg, shirt_mask); d = ImageDraw.Draw(img)
+    for i in range(-40, 40):
+        k = 1.0 + 0.18 * (1 - abs(i) / 40.0)
+        for y in range(int(h * 0.2), int(h * 0.9), 1):
+            x = int(w * 0.3 + (y - h * 0.2) * 0.35) + i
+            if 0 <= x < w and shirt_mask.getpixel((x, y)):
+                px = img.getpixel((x, y)); img.putpixel((x, y), tuple(min(255, int(c * k)) for c in px))
+    q = {1: (0.36, 0.38, 0.64, 0.66), 2: (0.34, 0.40, 0.66, 0.70), 3: (0.40, 0.45, 0.60, 0.65), 4: (0.33, 0.36, 0.67, 0.68), 5: (0.38, 0.42, 0.62, 0.66), 6: (0.44, 0.5, 0.64, 0.7)}[slot]
+    if behaviour == "edge": q = (0.55, 0.38, 0.95, 0.66)                 # straddles the sleeve edge and the background
+    if behaviour in ("ok", "edge"):
+        x0, y0, x1, y1 = int(q[0] * w), int(q[1] * h), int(q[2] * w), int(q[3] * h)
+        d.rectangle([x0, y0, x1 - 1, y1 - 1], fill=config.PLACEHOLDER_RGB)
+        if marker_pattern == "noisy":                                      # arbitrary magenta variants: must not influence the composite
+            for y in range(y0, y1):
+                v = 150 + ((y * 7) % 100)
+                d.line([(x0, y), (x1 - 1, y)], fill=(v, (y * 3) % 60, 255 - (y % 80)))
+    elif behaviour == "tiny":
+        d.rectangle([w * 0.49, h * 0.49, w * 0.52, h * 0.52], fill=config.PLACEHOLDER_RGB)
+    return img
+
+
 class OpenAIImagesProvider(Provider):
-    """OpenAI Images API (gpt-image-1). The key is read from the environment at call time and never
-    stored, printed, or logged. Not exercised by the tests; no live call is made during development."""
+    """OpenAI Images API with the model taken from the provider configuration. The key is read from
+    the environment at call time and never stored, printed, or logged. Not exercised live by tests."""
     name = "openai"
-    model = "gpt-image-1"
     ENDPOINT = "https://api.openai.com/v1/images/generations"
+    MODELS = "https://api.openai.com/v1/models/"
 
-    def __init__(self, pricing_path=None):
-        self._pricing_path = pricing_path or config.PRICING_PATH
+    def __init__(self, cfg):
+        self.cfg = cfg; self.model = cfg["model"]; self.size = cfg.get("size", config.IMAGE_SIZE)
+        caps = cfg.get("capabilities") or {}; self._qualities = set(caps.get("qualities") or []); self._sizes = set(caps.get("sizes") or []); self._pricing_path = cfg.get("pricing_path")
 
-    def configured(self): return bool(os.environ.get("OPENAI_API_KEY"))
-    def supports_quality(self, quality): return quality in ("low", "medium", "high")
-    def pricing_snapshot(self): return pricing.load_snapshot(self._pricing_path, self.name, self.model)
+    def supports_quality(self, quality): return quality in self._qualities
+    def supports_size(self, size): return size in self._sizes
+    def credentials_available(self): return bool(os.environ.get("OPENAI_API_KEY"))
+    def pricing_snapshot(self): return pricing.load_snapshot(self._pricing_path, self.name, self.model, self.size)
+
+    def model_available(self):
+        """GET /v1/models/<model>: free metadata call; True/False, or None if it could not be checked."""
+        key = os.environ.get("OPENAI_API_KEY")
+        if not key: return None
+        try:
+            req = urllib.request.Request(self.MODELS + self.model, headers={"Authorization": f"Bearer {key}"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.load(resp).get("id") == self.model
+        except urllib.error.HTTPError as e:
+            return False if e.code == 404 else None
+        except Exception:  # noqa: BLE001
+            return None
 
     def generate_scene(self, prompt, quality, size, metadata):
         key = os.environ.get("OPENAI_API_KEY")
-        if not key:
-            raise RuntimeError("OPENAI_API_KEY is not set")
+        if not key: raise RuntimeError("OPENAI_API_KEY is not set")
+        if not self.supports_quality(quality) or not self.supports_size(size): raise RuntimeError("requested quality or size is not in the configured capability record")
         body = json.dumps({"model": self.model, "prompt": prompt, "n": 1, "size": size, "quality": quality, "output_format": "png"}).encode()
         req = urllib.request.Request(self.ENDPOINT, data=body, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=180) as resp:
             data = json.load(resp)
-        png = base64.b64decode(data["data"][0]["b64_json"])
-        return {"png": png, "usage": data.get("usage", {}), "model": self.model, "quality": quality, "size": size}
+        return {"png": base64.b64decode(data["data"][0]["b64_json"]), "usage": data.get("usage", {}), "model": self.model, "quality": quality, "size": size}
 
 
-def make_provider(name, pricing_snapshot=None, pricing_path=None):
-    if name == "mock":
-        return MockProvider(pricing_snapshot=pricing_snapshot)
-    if name == "openai":
-        return OpenAIImagesProvider(pricing_path=pricing_path)
-    raise ValueError(f"unknown provider {name}")
+def make_provider(cfg):
+    if cfg["provider"] == "openai": return OpenAIImagesProvider(cfg)
+    raise ValueError(f"unknown provider {cfg['provider']!r}")

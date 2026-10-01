@@ -1,33 +1,49 @@
 #!/usr/bin/env python3
-"""1901-listing-studio CLI. Run with the repo's venv: .venv/bin/python render.py ...
+"""1901-listing-studio CLI. Run with the repo's venv: .venv/bin/python render.py <command> ...
 
-  render.py --design-id 1901-093 --evidence evidence.json --message "<the user's message>" [--provider mock|openai]
-            [--handoff-root R] [--campaign-root R] [--pricing PATH] [--mock-pricing PATH]
+  run       --design-id 1901-093 --evidence evidence.json --message "<the user's message, verbatim>"
+            [--provider-config PATH] [--handoff-root R] [--campaign-root R]
+  preflight [--provider-config PATH]        read-only: provider, model, credentials, tiers, size, pricing; no generation call
+  Fixtures only: --mock [--mock-pricing PATH] [--mock-model NAME]
 
-Prints exactly one JSON object (the skill's output). An ordinary message proposes; only the exact
-command AUTHORIZE LISTING RENDER <design_id> in --message renders. No secret is read except the
-provider's API key from the environment at call time, and it is never printed."""
-import argparse, json, sys, os
+Prints exactly one JSON object. An ordinary message proposes; only the exact command
+AUTHORIZE LISTING RENDER <design_id> in --message renders. The provider API key is read from the
+environment at call time by the adapter and is never printed or logged."""
+import argparse, json, os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from studio import config, job, providers, pricing
 
 
+def build_provider(a):
+    if a.mock:
+        snap = pricing.load_snapshot(a.mock_pricing, "mock", a.mock_model, config.IMAGE_SIZE) if a.mock_pricing else None
+        return providers.MockProvider(pricing_snapshot=snap, model=a.mock_model), None
+    cfg = providers.load_provider_config(a.provider_config)
+    if cfg is None:
+        return None, {"provider_configured": False, "provider_config_path": a.provider_config, "detail": "no valid provider configuration (provider + model required); nothing assumed", "generation_call_made": False}
+    try:
+        return providers.make_provider(cfg), None
+    except ValueError as e:
+        return None, {"provider_configured": False, "provider_config_path": a.provider_config, "detail": str(e), "generation_call_made": False}
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--design-id", required=True); p.add_argument("--evidence", required=True); p.add_argument("--message", default="")
-    p.add_argument("--provider", default="mock", choices=("mock", "openai")); p.add_argument("--handoff-root", default=config.HANDOFF_ROOT); p.add_argument("--campaign-root", default=config.CAMPAIGN_ROOT)
-    p.add_argument("--pricing", default=config.PRICING_PATH, help="pricing snapshot for the openai provider"); p.add_argument("--mock-pricing", help="pricing snapshot JSON for the mock provider (fixtures only)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for name in ("run", "preflight"):
+        s = sub.add_parser(name)
+        s.add_argument("--provider-config", default=config.PROVIDER_CONFIG_PATH); s.add_argument("--mock", action="store_true"); s.add_argument("--mock-pricing"); s.add_argument("--mock-model", default="mock-image-1")
+        if name == "run":
+            s.add_argument("--design-id", required=True); s.add_argument("--evidence", required=True); s.add_argument("--message", default="")
+            s.add_argument("--handoff-root", default=config.HANDOFF_ROOT); s.add_argument("--campaign-root", default=config.CAMPAIGN_ROOT)
     a = p.parse_args(argv)
+    prov, problem = build_provider(a)
+    if a.cmd == "preflight":
+        print(json.dumps(problem if problem else prov.preflight(), indent=1, ensure_ascii=False)); return 0
+    if problem:
+        print(json.dumps({"design_id": a.design_id, "result": "MODEL_OR_QUALITY_BLOCK", "render_performed": False, "checks": [{"check": "model_quality", "status": "FAIL", "detail": problem["detail"]}], "human_action_required": f"Write a provider configuration at {a.provider_config} (provider, model, size, capabilities, pricing_path). No model was assumed."}, indent=1, ensure_ascii=False)); return 0
     evidence = json.load(open(a.evidence, encoding="utf-8"))
-    if a.provider == "openai":
-        prov = providers.OpenAIImagesProvider(pricing_path=a.pricing)
-        if not prov.configured():
-            print(json.dumps({"design_id": a.design_id, "result": "MODEL_OR_QUALITY_BLOCK", "render_performed": False, "human_action_required": "No image provider is configured on this machine (OPENAI_API_KEY absent). Configuring one is a credential decision for Jody."}, indent=1)); return 0
-    else:
-        snap = pricing.load_snapshot(a.mock_pricing, "mock", "mock-image-1") if a.mock_pricing else None
-        prov = providers.MockProvider(pricing_snapshot=snap)
-    out = job.run(a.design_id, evidence, a.message, prov, handoff_root=a.handoff_root, campaign_root=a.campaign_root)
-    print(json.dumps(out, indent=1, ensure_ascii=False)); return 0
+    print(json.dumps(job.run(a.design_id, evidence, a.message, prov, handoff_root=a.handoff_root, campaign_root=a.campaign_root), indent=1, ensure_ascii=False)); return 0
 
 
 if __name__ == "__main__":

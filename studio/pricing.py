@@ -1,26 +1,23 @@
-"""Pricing snapshot. Shape:
-{"provider": "openai", "model": "gpt-image-1", "captured_at": "ISO", "basis": "where it came from",
- "currency": "USD", "per_image_usd": {"high": {"1024x1024": 0.167}, "medium": {"1024x1024": 0.042}}}
-No snapshot, or no price for the requested quality/size, means PRICING_UNAVAILABLE. Nothing is guessed."""
+"""Pricing snapshot, bound to the exact provider, model and size. Shape:
+{"provider": "openai", "model": "<exact configured model id>", "size": "1024x1024", "captured_at": "ISO",
+ "basis": "where it came from", "currency": "USD", "per_image_usd": {"high": {"1024x1024": 0.0}, "medium": {"1024x1024": 0.0}}}
+A snapshot for a different model or size, or missing any field, is PRICING_UNAVAILABLE. Nothing is guessed."""
 import json, os
 
 
-def load_snapshot(path, provider, model):
-    if not path or not os.path.isfile(path):
-        return None
+def load_snapshot(path, provider, model, size):
+    if not path or not os.path.isfile(path): return None
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            snap = json.load(f)
+        snap = json.load(open(path, encoding="utf-8"))
     except Exception:  # noqa: BLE001
         return None
-    if snap.get("provider") != provider or snap.get("model") != model:
-        return None
-    return snap if validate(snap) else None
+    return snap if validate(snap, provider, model, size) else None
 
 
-def validate(snap):
+def validate(snap, provider, model, size):
     try:
-        return bool(snap["captured_at"]) and bool(snap["basis"]) and snap.get("currency", "USD") == "USD" and isinstance(snap["per_image_usd"], dict)
+        return (snap["provider"] == provider and snap["model"] == model and snap["size"] == size and bool(snap["captured_at"]) and bool(snap["basis"])
+                and snap["currency"] == "USD" and isinstance(snap["per_image_usd"], dict))
     except (KeyError, TypeError):
         return False
 

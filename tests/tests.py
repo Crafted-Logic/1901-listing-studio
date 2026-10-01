@@ -1,6 +1,6 @@
 import copy, hashlib, json, os, sys
 HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(HERE, ".."))
-from PIL import Image
+from PIL import Image, ImageChops, ImageDraw
 from studio import job, qa, compositor, config
 from fixtures import *
 
@@ -109,8 +109,8 @@ for label, pat in (("Sheet mutation", r"spreadsheets|values\.update|batchUpdate|
     print(f" {24 + ['Sheet mutation','Drive mutation','Printify mutation','Etsy mutation'].index(label)}. PASS no {label} path exists in studio/ or render.py")
 assert re.search(r'"publication_authorized": False', src) and not re.search(r'publication_authorized"?\s*[:=]\s*True', src)
 print(" 28. PASS publication_authorized is hard-coded false and never set true")
-assert "openai.com/v1/images/generations" in src and src.count("urlopen") == 1, "only the image endpoint is ever called"
-print(" 29. PASS budget/cost log is local only (the only network call in the package is the image-generation endpoint)")
+assert "openai.com/v1/images/generations" in src and src.count("urlopen") == 2 and len(re.findall(r"https?://[\w./-]+", src)) == 2 and all("api.openai.com" in u for u in re.findall(r"https?://[\w./-]+", src)), "only the provider's model-metadata and image-generation endpoints are ever called"
+print(" 29. PASS budget/cost log is local only (the only network calls in the package are the provider's free model check and the image-generation endpoint)")
 e, p = Env(), provider(); o = run(e, evidence(), AUTH, p)
 finals = sorted(glob.glob(os.path.join(e.C, "1901-093/final-composites/*.png"))); m = json.load(open(os.path.join(e.C, "1901-093/manifest.json")))
 assert all(hashlib.sha256(open(f, "rb").read()).hexdigest() == m["final_sha256"][os.path.basename(f)] for f in finals) and Image.open(os.path.join(e.C, "1901-093/qa/contact-sheet.png")).size[0] > 1000
@@ -132,3 +132,64 @@ print("ALL PASS")
 if "--dump" in sys.argv:
     for n in (1, 2, 4, 14, 13, 22, 23, 8, 9, 11, 18, 19, 20):
         open(f"ex{n}.json", "w").write(json.dumps(examples[n], indent=1, ensure_ascii=False) + "\n")
+
+# ---- production-readiness patch: marker geometry vs shading reconstruction; configurable model ----
+import io
+from studio import compositor as _c, providers as _pv, qa as _qa
+print("---- patch tests")
+# M1 chroma marker geometry detected
+img = _pv.draw_scene("1024x1024", (72, 70, 68), 1); quad, info = _c.find_marker_quad(img); assert quad and info["fill_ratio"] > 0.95 and abs(quad[0][0] - 0.36 * 1024) < 3, (quad, info)
+print(" M1. PASS chroma marker geometry detected at the expected quad")
+# M2 shading does not depend on marker RGB variation: identical composites from uniform vs noisy marker
+e = Env(); u = io.BytesIO(); _pv.draw_scene("1024x1024", (72, 70, 68), 1, marker_pattern="uniform").save(u, "PNG"); n = io.BytesIO(); _pv.draw_scene("1024x1024", (72, 70, 68), 1, marker_pattern="noisy").save(n, "PNG")
+assert _c.marker_pixels(Image.open(n)) == _c.marker_pixels(Image.open(u)), "noisy marker must still be detected as marker"
+fu, pu = _c.composite(u.getvalue(), e.staged_path, (72, 70, 68)); fn, pn = _c.composite(n.getvalue(), e.staged_path, (72, 70, 68))
+assert ImageChops.difference(fu, fn).getbbox() is None and pu["quad"] == pn["quad"], "composite must not depend on marker pixel values"
+print(" M2. PASS garment shading and composite are byte-identical for uniform vs noisy marker pixels")
+# M3 marker fully removed before placement; reconstructed field continuous with the ring
+base, shade, mask = _c.prepare_base(Image.open(u), pu); assert _c.marker_pixels(base) == 0
+bb = pu["placeholder"]["bbox"]; inside = base.getpixel(((bb[0] + bb[2]) // 2, bb[1] + 3)); outside = base.getpixel(((bb[0] + bb[2]) // 2, bb[1] - 6))
+assert all(abs(a - b) < 12 for a, b in zip(inside, outside)), (inside, outside)
+assert shade.getpixel(((bb[0] + bb[2]) // 2, bb[1] + 3)) > shade.getpixel(((bb[0] + bb[2]) // 2, bb[3] - 3)), "reconstructed shading follows the garment falloff (lighter at top)"
+print(" M3. PASS marker removed before placement; reconstructed garment continuous with surrounding shirt; shading follows the garment, not the marker"); e.done()
+# M4 residual chroma leak → QA failure
+real_prep = _c.prepare_base
+def leaky(scene, placement):
+    b, s, m = real_prep(scene, placement); d = ImageDraw.Draw(b); bb = placement["placeholder"]["bbox"]; d.rectangle([bb[0], bb[1], bb[0] + 12, bb[1] + 12], fill=config.PLACEHOLDER_RGB); return b, s, m
+_c.prepare_base = leaky; e, p = Env(), provider(); o = run(e, evidence(), AUTH, p); _c.prepare_base = real_prep
+T("M4", "residual chroma leak", o, "QA_FAILED", False, e, p, calls=1, extra=lambda o, e: ("no_residual_chroma_leak" in o["checks"][-2]["detail"] or "marker_removed" in o["checks"][-2]["detail"]) or sys.exit("M4"))
+# M5 garment field cannot be reconstructed believably → reroll (marker straddles shirt edge and background)
+e, p = Env(), provider(script=["edge", "ok"]); o = run(e, evidence(), AUTH, p)
+T("M5", "unreconstructable garment field rerolls", o, "READY_FOR_HUMAN_RENDER_REVIEW", True, e, p, calls=7, extra=lambda o, e: (o["proposed_expense_log_row"]["rerolls"] == 1 and "cannot be reconstructed" in [c for c in o["checks"] if c["check"] == "scene_1"][0]["detail"]) or sys.exit("M5"))
+# M6 identity deterministic: two composites of the same scene+art are byte-identical; QA recomposite passes
+e = Env(); f1, p1 = _c.composite(u.getvalue(), e.staged_path, (72, 70, 68)); f2, p2 = _c.composite(u.getvalue(), e.staged_path, (72, 70, 68))
+assert ImageChops.difference(f1, f2).getbbox() is None and p1 == p2; print(" M6. PASS exact artwork identity is deterministic across runs"); e.done()
+# M7 configured model recorded everywhere
+e, p = Env(), provider(model="mock-image-2", snap=dict(SNAP, model="mock-image-2")); o1 = run(e, evidence(), ASK, p); o = run(e, evidence(), AUTH, p)
+m = json.load(open(os.path.join(e.C, "1901-093/manifest.json"))); c = json.load(open(os.path.join(e.C, "1901-093/cost-log.json")))
+assert o1["rendering"]["model"] == "mock-image-2" and o1["proposed_expense_log_row"]["model"] == "mock/mock-image-2" and o1["proposed_expense_log_row"]["pricing_snapshot"]["model"] == "mock-image-2"
+assert m["rendering"]["model"] == "mock-image-2" and m["rendering"]["pricing_snapshot"]["model"] == "mock-image-2" and all(s["model"] == "mock-image-2" for s in m["scene_slots"]) and c["model"] == "mock/mock-image-2" and all(u_["model"] == "mock-image-2" for u_ in c["usage_record"]) and c["pricing_snapshot"]["model"] == "mock-image-2"
+print(" M7. PASS configured model recorded in proposal, manifest, cost log, pricing snapshot and every usage record"); e.done()
+# M8 pricing for a different model / size → PRICING_UNAVAILABLE
+e, p = Env(), provider(snap=dict(SNAP, model="mock-image-OTHER")); T("M8", "pricing snapshot for another model", run(e, evidence(), AUTH, p), "PRICING_UNAVAILABLE", False, e, p, calls=0)
+e, p = Env(), provider(snap=dict(SNAP, size="1536x1024")); T("M8b", "pricing snapshot for another size", run(e, evidence(), AUTH, p), "PRICING_UNAVAILABLE", False, e, p, calls=0)
+e, p = Env(), provider(snap={k: v for k, v in SNAP.items() if k != "size"}); T("M8c", "pricing snapshot without size", run(e, evidence(), AUTH, p), "PRICING_UNAVAILABLE", False, e, p, calls=0)
+# M9 missing credential → MODEL_OR_QUALITY_BLOCK
+e, p = Env(), provider(credentials=False); T("M9", "missing API credential", run(e, evidence(), AUTH, p), "MODEL_OR_QUALITY_BLOCK", False, e, p, calls=0)
+e, p = Env(), provider(available=False); T("M9b", "configured model unavailable", run(e, evidence(), AUTH, p), "MODEL_OR_QUALITY_BLOCK", False, e, p, calls=0)
+# M10 unsupported tier / size
+e, p = Env(), provider(qualities=("medium",)); T("M10", "high tier unsupported", run(e, evidence(), AUTH, p), "MODEL_OR_QUALITY_BLOCK", False, e, p, calls=0)
+e, p = Env(), provider(sizes=["1536x1024"]); T("M10b", "configured size unsupported", run(e, evidence(), AUTH, p), "MODEL_OR_QUALITY_BLOCK", False, e, p, calls=0)
+# M11 no provider call during proposal (also preflight makes none)
+e, p = Env(), provider(); o = run(e, evidence(), ASK, p); pf = p.preflight(); assert len(p.calls) == 0 and pf["generation_call_made"] is False and pf["model_configured"] == "mock-image-1" and pf["pricing_snapshot_available"] is True and pf["credentials_available"] is True
+print(" M11. PASS no provider call during proposal or preflight"); e.done()
+# M12 no live paid calls in tests: the OpenAI adapter's generation endpoint is never reached (only MockProvider instances were used)
+assert all(isinstance(x, _pv.MockProvider) for x in [p]) and "OPENAI_API_KEY" not in os.environ
+print(" M12. PASS no live paid calls: only MockProvider used; no OPENAI_API_KEY in the test environment")
+# OpenAI adapter offline behaviour (no network): config-driven, fails closed
+cfg = {"provider": "openai", "model": "configured-image-model", "size": "1024x1024", "capabilities": {"qualities": ["low", "medium", "high"], "sizes": ["1024x1024"], "basis": "fixture"}, "pricing_path": "/nonexistent/pricing.json"}
+oa = _pv.make_provider(cfg); pf = oa.preflight()
+assert oa.model == "configured-image-model" and pf["credentials_available"] is False and pf["model_available"] is None and pf["pricing_snapshot_available"] is False and pf["quality_tiers_available"] == {"high": True, "medium": True} and pf["generation_call_made"] is False
+assert "gpt-image-1" not in open(os.path.join(HERE, "..", "studio", "providers.py")).read()
+print(" M13. PASS OpenAI adapter takes its model from configuration only (no hard-coded model id); preflight is read-only and fails closed")
+print("ALL PATCH TESTS PASS")

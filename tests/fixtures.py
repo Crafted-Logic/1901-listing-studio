@@ -10,7 +10,7 @@ JOB = "fixture001"
 ASK = "Render the listing campaign for 1901-093."
 AUTH = "AUTHORIZE LISTING RENDER 1901-093"
 PRODUCT = {"blank": "Comfort Colors 1717 Garment-Dyed Heavyweight T-Shirt", "provider": "Printify / Monster Digital", "color": "Pepper", "garment_rgb": [72, 70, 68], "spec_source": "Idea Queue row 95 + 01 — 1901 Listing Render System (CURRENT) §Product"}
-SNAP = {"provider": "mock", "model": "mock-image-1", "captured_at": "2026-10-01T00:00:00Z", "basis": "fixture pricing for tests", "currency": "USD", "per_image_usd": {"high": {"1024x1024": 0.20}, "medium": {"1024x1024": 0.05}}}
+SNAP = {"provider": "mock", "model": "mock-image-1", "size": "1024x1024", "captured_at": "2026-10-01T00:00:00Z", "basis": "fixture pricing for tests", "currency": "USD", "per_image_usd": {"high": {"1024x1024": 0.20}, "medium": {"1024x1024": 0.05}}}
 
 
 def art_png(path, size=(1400, 1000), alpha=True):
@@ -53,5 +53,5 @@ def evidence(status="Approved", hd="APPROVE", rsp=URL, resolver_result="RESOLVED
             "requires_transparency": requires_transparency, "monthly_recorded_usd": monthly, "atmosphere": {"concept": "Porch cat", "season": "Fall", "vibe": "Nostalgic"}}
 
 
-def provider(script=None, snap=SNAP, qualities=("high", "medium")):
-    return providers.MockProvider(pricing_snapshot=snap, qualities=qualities, script=script)
+def provider(script=None, snap=SNAP, qualities=("high", "medium"), **kw):
+    return providers.MockProvider(pricing_snapshot=snap, qualities=qualities, script=script, **kw)

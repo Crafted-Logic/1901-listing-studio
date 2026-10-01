@@ -11,9 +11,10 @@ ROLE_TEXT = {
     "product_construction_detail": "Close product photograph showing garment construction: collar, stitching, hem or sleeve cuff, fabric weave; part of the chest print area visible at the edge of frame.",
 }
 
-PLACEHOLDER = ("On the chest print area of the shirt there is one perfectly flat, uniform, solid magenta rectangle "
-               "(pure #FF00FF), sharp-edged, following the fabric's shading, drape and perspective exactly as a printed panel would. "
-               "The rectangle is completely blank: no text, no letters, no logo, no graphic, no pattern inside it.")
+PLACEHOLDER = ("On the chest print area of the shirt there is one flat, solid, pure magenta (#FF00FF) rectangle marking where a print "
+               "will go, sharp-edged and following the garment's perspective and drape so its outline sits on the fabric like a printed panel. "
+               "The rectangle is completely blank: no text, no letters, no logo, no graphic, no pattern inside it. "
+               "The fabric immediately around the rectangle must be plain, continuous shirt with natural shading and no seams crossing into the rectangle.")
 
 GUARDS = ("No text anywhere in the image. No logos, brand marks, labels, tags, watermarks or signage. No other graphics on the garment. "
           "No people's faces in close-up. Photorealistic, natural light, no illustration style.")
