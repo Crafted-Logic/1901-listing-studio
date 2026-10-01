@@ -388,9 +388,15 @@ lives at `/home/claude/.config/1901-listing-studio/provider.json`:
 }
 ```
 
-Credentials come only from the runtime environment (`OPENAI_API_KEY` for
-the OpenAI adapter), read at call time, never stored, printed or logged, and
-never committed. The adapter verifies at runtime, without any paid call,
+Credentials come only from the runtime environment, read at call time,
+never stored, printed or logged, and never committed. The adapter reads
+`OPENAI_API_KEY` first and then `LISTING_STUDIO_OPENAI_API_KEY`. The second
+name exists because OpenMausBot's Claude launcher deliberately deletes
+`OPENAI_API_KEY`, along with every other provider-credential name, from a
+bot's environment so that a foreign key can never change a CLI's billing
+identity; on this VPS the key therefore reaches Walter only under the
+harness-safe name, supplied through the openmausbot service's root-owned
+environment file. Preflight reports which name was found, never the value. The adapter verifies at runtime, without any paid call,
 that credentials are present, that the configured model is available to
 them (a free model-metadata request), and that the configured capability
 record lists both governed quality tiers and the configured size. Anything
@@ -406,8 +412,9 @@ cd /home/claude/agents/1901/1901-listing-studio && .venv/bin/python render.py pr
 ```
 
 It reports: provider configured, model configured, credentials available
-(yes/no only), model available, quality tiers available, size supported,
-pricing snapshot available and which model it is for.
+(yes/no only) and which variable name supplied them, model available,
+quality tiers available, size supported, pricing snapshot available and
+which model it is for.
 
 ## Running the Renderer
 
