@@ -62,7 +62,7 @@ class Provider:
 
 class MockProvider(Provider):
     """Draws a synthetic garment scene with real shading and a UNIFORM chroma marker (the marker carries
-    no shading information). `script` lists per-call behaviours: "ok", "no_marker", "tiny", "edge", "purple_bg", "hollow", "fragmented"
+    no shading information). `script` lists per-call behaviours: "ok", "no_marker", "tiny", "edge", "purple_bg", "hollow", "fragmented", "grain", "mottled", "hard_shadow", "stripes"
     (marker straddling the shirt edge: ring inconsistent), "error". Beyond the script: "ok".
     marker_pattern "uniform" | "noisy" controls the marker's own pixel values (for the test proving
     shading does not depend on them)."""
@@ -103,6 +103,24 @@ def draw_scene(size, color, slot, behaviour="ok", marker_pattern="uniform"):
             if 0 <= x < w and shirt_mask.getpixel((x, y)):
                 px = img.getpixel((x, y)); img.putpixel((x, y), tuple(min(255, int(c * k)) for c in px))
     q = {1: (0.36, 0.38, 0.64, 0.66), 2: (0.34, 0.40, 0.66, 0.70), 3: (0.40, 0.45, 0.60, 0.65), 4: (0.33, 0.36, 0.67, 0.68), 5: (0.38, 0.42, 0.62, 0.66), 6: (0.44, 0.5, 0.64, 0.7)}[slot]
+    # garment-surface behaviours, applied to the shirt before the marker is drawn (ring fixtures for the garment-field check)
+    if behaviour in ("grain", "mottled", "hard_shadow", "stripes"):
+        px = img.load(); s = 7
+        for y in range(int(h * 0.2), int(h * 0.9)):
+            for x in range(int(w * 0.15), int(w * 0.85)):
+                if not shirt_mask.getpixel((x, y)): continue
+                r, g, b = px[x, y]
+                if behaviour == "grain":        # photographic grain (+-4) plus a gentle lateral lighting gradient: legitimate fabric
+                    s = (s * 1103515245 + 12345) & 0x7fffffff; dd = (s % 9) - 4; k = 1 + 0.25 * (x - w * 0.5) / (w * 0.35)
+                    px[x, y] = tuple(max(0, min(255, int(v * k) + dd)) for v in (r, g, b))
+                elif behaviour == "mottled":    # +-20 random speckle: not reconstructable
+                    s = (s * 1103515245 + 12345) & 0x7fffffff; dd = (s % 41) - 20
+                    px[x, y] = tuple(max(0, min(255, v + dd)) for v in (r, g, b))
+                elif behaviour == "hard_shadow" and y < h * 0.52:   # hard-edged shadow over the upper chest, two thirds darker
+                    px[x, y] = tuple(v // 3 for v in (r, g, b))
+                elif behaviour == "stripes" and (y // 6) % 2 == 0:  # a striped garment: multicolour ring
+                    px[x, y] = tuple(min(255, v + 40) for v in (r, g, b))
+        d = ImageDraw.Draw(img); behaviour = "ok"
     if behaviour == "edge": q = (0.55, 0.38, 0.95, 0.66)                 # straddles the sleeve edge and the background
     if behaviour in ("ok", "edge"):
         x0, y0, x1, y1 = int(q[0] * w), int(q[1] * h), int(q[2] * w), int(q[3] * h)

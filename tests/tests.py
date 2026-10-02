@@ -264,6 +264,55 @@ print(" R3. PASS attribution is validator-defect only with a complete ruling nam
 # R4 a failed job's spend stays in the monthly floor whatever its attribution
 e, p = Env(), provider(); failed_fixture(e, cost=5.0); o = run(e, evidence(monthly=1.0), ASK, p); assert o["budget"]["monthly_recorded_cost_usd"] == 5.0 and any("Local cost logs" in w for w in o["warnings"]); e.done()
 print(" R4. PASS a validator-defect job's spend still counts toward the monthly cap")
+# ---- dark-garment ring rule (review of the cv limitation found in 735f67d) ----
+# K1 the rule itself over real and synthetic rings: cv rule unchanged above mean 28; below it, absolute spread + texture
+def ring_judge(scene):
+    mask, _ = _c.isolate_marker(scene); st = _c.ring_stats(scene, mask); ok, why, rule = _c.ring_acceptable(st); return st, ok, why, rule
+DARK = {"black": (8, 8, 10), "near-black": (20, 20, 22)}; LIGHTER = {"charcoal": (40, 40, 44), "dark gray": (72, 70, 68), "mid": (128, 128, 128), "light": (200, 200, 196)}
+for name, col in DARK.items():
+    for beh, expect in (("ok", True), ("grain", True), ("mottled", False), ("stripes", False), ("edge", False)):
+        st, ok, why, rule = ring_judge(_pv.draw_scene("1024x1024", col, 1, behaviour=beh)); assert ok is expect and st["mean_luminance"] <= _c.RING_DARK_MEAN_MAX or beh in ("stripes", "edge"), (name, beh, st, why)
+        if beh == "mottled" and st["std"] <= _c.RING_DARK_MAX_STD: assert "mottled or noisy" in why, why
+    st, ok, why, rule = ring_judge(_pv.draw_scene("1024x1024", col, 1, behaviour="hard_shadow"))
+    assert ok and rule == "dark-absolute", (name, st)                           # documented limitation: <= ~14-level hard shadow on near-black is indistinguishable from drape
+st, ok, why, rule = ring_judge(_pv.draw_scene("1024x1024", (40, 40, 44), 1, behaviour="hard_shadow")); assert not ok and st["mean_luminance"] <= 28 and "std" in why, (st, why)   # a 27-level hard shadow drops the ring into the dark regime and the spread cap rejects it
+for name, col in LIGHTER.items():
+    for beh in ("ok", "grain", "mottled", "hard_shadow", "stripes", "edge"):
+        st, ok, why, rule = ring_judge(_pv.draw_scene("1024x1024", col, 1, behaviour=beh))
+        if beh == "hard_shadow" and st["mean_luminance"] <= _c.RING_DARK_MEAN_MAX: assert not ok, (name, st); continue
+        assert ok == (st["cv"] <= _c.RING_MAX_CV) and (rule in (None, "cv")), (name, beh, st)   # exactly the pre-existing cv behaviour at mean > 28 (incl. its leniency to mottle on midtones), dark branch never used
+print(" K1. PASS ring rule: cv unchanged at mean > 28 (midtone leniency included); dark branch accepts plain/grainy black, rejects mottle, stripes, background and a 27-level hard shadow")
+# K2 the branch never loosens the spread: at the boundary the absolute cap (10) is below what cv allows at mean 28 (9.8 ~ 10) and above it only cv applies
+assert abs(_c.RING_DARK_MAX_STD - _c.RING_MAX_CV * _c.RING_DARK_MEAN_MAX) < 1e-9 and _c.RING_DARK_MEAN_MAX == 28
+def fake(mean, std, texture=1.0, chroma=0): return {"pixels": 5000, "mean_luminance": mean, "std": std, "cv": round(std / mean, 4), "texture": texture, "chroma_pixels_in_ring": chroma}
+assert _c.ring_acceptable(fake(28.5, 9.0))[0] is True and _c.ring_acceptable(fake(28.5, 9.0))[2] == "cv"
+assert _c.ring_acceptable(fake(29.0, 10.5))[0] is False                                  # just above the dark regime: cv 0.36 rejects as before
+assert _c.ring_acceptable(fake(27.0, 10.5))[0] is False                                  # inside it: spread cap rejects
+assert _c.ring_acceptable(fake(27.0, 9.9))[0] is False                                   # 9.9 > 9.8: spread cap rejects
+assert _c.ring_acceptable(fake(27.0, 9.5, texture=5.2))[0] is False                      # texture cap rejects
+ok_, _, rule_ = _c.ring_acceptable(fake(27.0, 9.5, texture=4.9)); assert ok_ and rule_ == "dark-absolute"
+assert _c.ring_acceptable(fake(27.0, 9.5, texture=4.9, chroma=1))[0] is False            # chroma always rejects
+assert _c.ring_acceptable(None)[0] is False
+print(" K2. PASS boundary behaviour: no loosening above mean 28; spread, texture and chroma caps all fail closed")
+# K3 full runs on a near-black governed garment: grainy hero renders with no reroll and records the rule; mottled hero rerolls
+NB = [{"blank": "Unisex Heavy Cotton Tee", "provider": "Printify Choice", "color": "Black", "garment_rgb": [20, 20, 22], "spec_source": "fixture"}]
+e, p = Env(), provider(script=["grain"]); o = run(e, evidence(product_candidates=NB), AUTH, p)
+def dark_ok(o, e):
+    m = json.load(open(os.path.join(e.C, "1901-093/manifest.json"))); r = m["scene_slots"][0]["placement"]["ring"]
+    assert o["proposed_expense_log_row"]["rerolls"] == 0 and r["rule"] in ("cv", "dark-absolute") and "std" in r and "texture" in r, r
+T("K3", "near-black garment, grainy hero: no reroll", o, "READY_FOR_HUMAN_RENDER_REVIEW", True, e, p, calls=6, extra=dark_ok)
+e, p = Env(), provider(script=["mottled"]); o = run(e, evidence(product_candidates=NB), AUTH, p)
+T("K3b", "near-black garment, mottled hero rerolls", o, "READY_FOR_HUMAN_RENDER_REVIEW", True, e, p, calls=7, extra=lambda o, e: (o["proposed_expense_log_row"]["rerolls"] == 1 and "cannot be reconstructed" in [c for c in o["checks"] if c["check"] == "scene_1"][0]["detail"]) or sys.exit("K3b"))
+CH = [dict(NB[0], garment_rgb=[40, 40, 44], color="Charcoal")]
+e, p = Env(), provider(script=["hard_shadow"]); o = run(e, evidence(product_candidates=CH), AUTH, p)
+T("K3c", "charcoal garment, hard-shadowed hero rerolls", o, "READY_FOR_HUMAN_RENDER_REVIEW", True, e, p, calls=7, extra=lambda o, e: (o["proposed_expense_log_row"]["rerolls"] == 1) or sys.exit("K3c"))
+e, p = Env(), provider(script=["stripes"]); o = run(e, evidence(product_candidates=NB), AUTH, p)
+T("K3d", "near-black striped garment rerolls", o, "READY_FOR_HUMAN_RENDER_REVIEW", True, e, p, calls=7)
+e, p = Env(), provider(script=["edge"]); o = run(e, evidence(product_candidates=NB), AUTH, p)
+T("K3e", "near-black marker straddling the background rerolls", o, "READY_FOR_HUMAN_RENDER_REVIEW", True, e, p, calls=7)
+# K4 determinism of the new statistics
+sc = _pv.draw_scene("1024x1024", (20, 20, 22), 1, behaviour="grain"); a = ring_judge(sc)[0]; b = ring_judge(sc.copy())[0]; assert a == b
+print(" K4. PASS ring statistics are deterministic")
 print("ALL PATCH TESTS PASS")
 if "--dump" in sys.argv:
     for n in (1, 2, 4, 14, 13, 22, 23, 8, 9, 11, 18, 19, 20, "M4", "R1"):

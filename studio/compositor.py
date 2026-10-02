@@ -17,7 +17,14 @@ from . import config
 
 GRID = 56            # harmonic fill grid (long side)
 RING = 9             # width in px of the surrounding-shirt ring used as the boundary condition
-RING_MAX_CV = 0.35   # max coefficient of variation of ring luminance for a believable reconstruction
+RING_MAX_CV = 0.35   # max coefficient of variation of ring luminance for a believable reconstruction (unchanged)
+# Dark-garment branch (evidence: five real black-shirt rings, job 4c8fda750c, mean 18-26, std 6.5-9.1, texture 2.4-3.2;
+# synthetic black/near-black/charcoal good vs mottled/shadow/stripe/background rings). cv = std/mean is scale-biased
+# below mean ~28: a plain black shirt's 6-9 luminance levels of drape give cv 0.38-0.49. Below RING_DARK_MEAN_MAX the
+# absolute spread and the high-frequency texture decide instead; the spread bound equals what cv allows at mean 28 (0.35*28 = 9.8).
+RING_DARK_MEAN_MAX = 28      # luminance mean at or below which the dark branch may apply
+RING_DARK_MAX_STD = 9.8      # absolute spread cap = exactly what cv 0.35 allows at mean 28 (0.35*28); real evidence max 9.12
+RING_DARK_MAX_TEXTURE = 5    # mean |L - blur(L, 2)| on the ring: random mottle >= +-12 scores >= 5.4; real fabric <= 3.2
 MARKER_DOMINANCE = 4.0   # the chest marker must be at least this many times larger than any other plausible component
 
 
@@ -179,16 +186,48 @@ def fit_art_quad(quad, aw, ah):
 
 def ring_stats(scene, mask):
     """Luminance statistics of the garment ring just outside the marker (the boundary condition)."""
-    dil = mask.convert("L").filter(ImageFilter.MaxFilter(2 * RING + 1))
-    ring = ImageChops.subtract(dil, mask.convert("L"))
+    m = mask.convert("L")
+    dil = m.filter(ImageFilter.MaxFilter(2 * RING + 1))
+    ring = ImageChops.subtract(dil, m)
     lum = scene.convert("L")
-    hist = ImageChops.multiply(lum, ring).histogram()[1:]       # luminance histogram of ring pixels (0 excluded)
+    off = lum.point(lambda v: min(255, v + 1))                   # +1 so a luminance of 0 is still counted
+    hist = ImageChops.multiply(off, ring).histogram()[1:]
     n = sum(hist)
     if n < 50: return None
-    mean = sum((i + 1) * c for i, c in enumerate(hist)) / n
-    var = sum(c * ((i + 1) - mean) ** 2 for i, c in enumerate(hist)) / n
+    mean = sum(i * c for i, c in enumerate(hist)) / n
+    var = sum(c * (i - mean) ** 2 for i, c in enumerate(hist)) / n
+    std = math.sqrt(var)
+    cum = 0; median = 0
+    for i, c in enumerate(hist):
+        cum += c
+        if cum >= n / 2: median = i; break
+    # high-frequency texture of the ring, with the marker neutralised to the ring median so the blur never sees magenta
+    neutral = Image.composite(Image.new("L", lum.size, median), lum, m)
+    hp = ImageChops.difference(neutral, neutral.filter(ImageFilter.GaussianBlur(2))).point(lambda v: min(255, v + 1))
+    hh = ImageChops.multiply(hp, ring).histogram()[1:]
+    texture = sum(i * c for i, c in enumerate(hh)) / n
     chroma_in_ring = marker_pixels(Image.composite(scene, Image.new("RGB", scene.size, (0, 0, 0)), ring))
-    return {"pixels": n, "mean_luminance": round(mean, 2), "cv": round(math.sqrt(var) / mean, 4) if mean else 9.0, "chroma_pixels_in_ring": chroma_in_ring}
+    return {"pixels": n, "mean_luminance": round(mean, 2), "std": round(std, 2), "cv": round(std / mean, 4) if mean else 9.0,
+            "texture": round(texture, 2), "chroma_pixels_in_ring": chroma_in_ring}
+
+
+def ring_acceptable(stats):
+    """Is the garment ring believable enough to reconstruct the print area from? Returns (ok, reason, rule).
+    The cv rule is unchanged. A ring that fails it is re-judged only when its mean luminance is at or below
+    RING_DARK_MEAN_MAX, by absolute spread and texture; anything else fails exactly as before."""
+    if stats is None:
+        return False, "no garment ring around the marker", None
+    if stats["chroma_pixels_in_ring"]:
+        return False, f"chroma pixels in the surrounding ring ({stats['chroma_pixels_in_ring']})", None
+    if stats["cv"] <= RING_MAX_CV:
+        return True, "", "cv"
+    if stats["mean_luminance"] <= RING_DARK_MEAN_MAX:
+        if stats["std"] > RING_DARK_MAX_STD:
+            return False, f"surrounding garment is not consistent enough to reconstruct believably (dark garment, luminance std {stats['std']} over the {RING_DARK_MAX_STD} cap; cv {stats['cv']})", None
+        if stats["texture"] > RING_DARK_MAX_TEXTURE:
+            return False, f"surrounding garment is mottled or noisy, not reconstructable (dark garment, texture {stats['texture']} over the {RING_DARK_MAX_TEXTURE} cap; cv {stats['cv']})", None
+        return True, "", "dark-absolute"
+    return False, f"surrounding garment is not consistent enough to reconstruct believably (luminance cv {stats['cv']})", None
 
 
 def reconstruct_garment(scene, mask, bbox):
@@ -246,9 +285,10 @@ def composite(scene_png_bytes, art_png_path, garment_rgb):
     quad, info = find_marker_quad(scene)
     if quad is None: raise CompositeError("UNUSABLE_SCENE", info)
     stats = ring_stats(scene, isolate_marker(scene)[0])
-    if stats is None or stats["chroma_pixels_in_ring"] > 0 or stats["cv"] > RING_MAX_CV:
-        why = "no garment ring around the marker" if stats is None else (f"chroma pixels in the surrounding ring ({stats['chroma_pixels_in_ring']})" if stats["chroma_pixels_in_ring"] else f"surrounding garment is not consistent enough to reconstruct believably (luminance cv {stats['cv']})")
+    ok, why, rule = ring_acceptable(stats)
+    if not ok:
         raise CompositeError("UNUSABLE_SCENE", f"local garment field cannot be reconstructed: {why}")
+    stats = dict(stats, rule=rule)
     art = Image.open(art_png_path); art_mode = art.mode; has_alpha = "A" in art.getbands(); art = art.convert("RGBA")
     aw, ah = art.size
     sub, fitted_w, fitted_h = fit_art_quad(quad, aw, ah)

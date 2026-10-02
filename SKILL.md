@@ -314,10 +314,19 @@ Two separate concerns, deliberately kept apart:
   of garment just outside the marker is the boundary condition, a Laplace
   fill on a downsampled grid produces the smooth local luminance and color
   field, and it is upsampled bilinearly under the marker. If the ring is not
-  believable garment (it contains chroma, is too small, or its luminance is
-  too inconsistent, as when the marker straddles the shirt edge and the
-  background) the scene is rejected and rerolled; the print region is never
-  flattened to a flat color.
+  believable garment the scene is rejected and rerolled; the print region is
+  never flattened to a flat color. The ring is believable when it contains
+  no chroma and either its luminance coefficient of variation is at most
+  0.35 (the rule for every garment at mean luminance above 28), or, for a
+  dark garment (ring mean luminance at most 28, where that ratio is
+  scale-biased: a plain black shirt's six to nine levels of drape give 0.38
+  to 0.49), its absolute luminance spread (std) is at most 9.8 and its
+  high-frequency texture (mean residual after a 2 px blur, marker
+  neutralised) is at most 5. Both dark-branch caps were derived from the five
+  real black-shirt rings of job `4c8fda750c` (std 6.5 to 9.1, texture 2.4 to
+  3.2) against mottled, striped, hard-shadowed and background-straddling
+  fixtures; the spread cap is exactly what the ratio rule allows at mean 28. The
+  placement records which rule admitted the ring (`ring.rule`).
 
 The compositor (`studio/compositor.py`, Pillow only, no model call) then:
 
@@ -3334,6 +3343,18 @@ no sheet cell, Drive file, Printify or Etsy object, or downstream system was
 touched.
 
 ## Assumptions and Limits
+
+- **Dark-garment ring rule, known limits.** On a near-black garment a
+  hard-edged shadow of up to about 14 luminance levels in the ring is
+  statistically indistinguishable from legitimate drape (a real crease in
+  one of the `4c8fda750c` rings scores higher on every edge metric tried),
+  so it is admitted; the human checks `realistic_fold_interaction` and
+  `plausible_artwork_placement` remain the control. Hard shadows of 27
+  levels or more, random mottle of ±12 or more, stripes and background
+  intrusion are rejected. The coefficient-of-variation rule above mean 28
+  is unchanged by this review and remains lenient on midtone and light
+  garments (random ±20 mottle or 12 px stripes on a mid-grey shirt pass
+  it); that is pre-existing behaviour, recorded here, not widened.
 
 - OpenMausBot imports `SKILL.md` only; `render.py`, `studio/`, the `.venv`
   with Pillow and `tests/` live in this repository's local clone at
