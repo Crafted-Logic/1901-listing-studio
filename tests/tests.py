@@ -144,7 +144,7 @@ fu, pu = _c.composite(u.getvalue(), e.staged_path, (72, 70, 68)); fn, pn = _c.co
 assert ImageChops.difference(fu, fn).getbbox() is None and pu["quad"] == pn["quad"], "composite must not depend on marker pixel values"
 print(" M2. PASS garment shading and composite are byte-identical for uniform vs noisy marker pixels")
 # M3 marker fully removed before placement; reconstructed field continuous with the ring
-base, shade, mask = _c.prepare_base(Image.open(u), pu); assert _c.marker_pixels(base) == 0
+base, shade, mask, _ri = _c.prepare_base(Image.open(u), pu); assert _c.marker_pixels(base) == 0
 bb = pu["placeholder"]["bbox"]; inside = base.getpixel(((bb[0] + bb[2]) // 2, bb[1] + 3)); outside = base.getpixel(((bb[0] + bb[2]) // 2, bb[1] - 6))
 assert all(abs(a - b) < 12 for a, b in zip(inside, outside)), (inside, outside)
 assert shade.getpixel(((bb[0] + bb[2]) // 2, bb[1] + 3)) > shade.getpixel(((bb[0] + bb[2]) // 2, bb[3] - 3)), "reconstructed shading follows the garment falloff (lighter at top)"
@@ -152,7 +152,7 @@ print(" M3. PASS marker removed before placement; reconstructed garment continuo
 # M4 residual chroma leak → QA failure
 real_prep = _c.prepare_base
 def leaky(scene, placement):
-    b, s, m = real_prep(scene, placement); d = ImageDraw.Draw(b); bb = placement["placeholder"]["bbox"]; d.rectangle([bb[0], bb[1], bb[0] + 12, bb[1] + 12], fill=config.PLACEHOLDER_RGB); return b, s, m
+    b, s, m, ri = real_prep(scene, placement); d = ImageDraw.Draw(b); bb = placement["placeholder"]["bbox"]; d.rectangle([bb[0], bb[1], bb[0] + 12, bb[1] + 12], fill=config.PLACEHOLDER_RGB); return b, s, m, ri
 _c.prepare_base = leaky; e, p = Env(), provider(); o = run(e, evidence(), AUTH, p); _c.prepare_base = real_prep
 T("M4", "residual chroma leak", o, "QA_FAILED", False, e, p, calls=1, extra=lambda o, e: ("no_residual_chroma_leak" in o["checks"][-2]["detail"] or "marker_removed" in o["checks"][-2]["detail"]) or sys.exit("M4"))
 # M5 garment field cannot be reconstructed believably → reroll (marker straddles shirt edge and background)
@@ -313,7 +313,118 @@ T("K3e", "near-black marker straddling the background rerolls", o, "READY_FOR_HU
 # K4 determinism of the new statistics
 sc = _pv.draw_scene("1024x1024", (20, 20, 22), 1, behaviour="grain"); a = ring_judge(sc)[0]; b = ring_judge(sc.copy())[0]; assert a == b
 print(" K4. PASS ring statistics are deterministic")
+import tempfile as _tf
+def _scene_png(img):
+    path = os.path.join(_tf.mkdtemp(prefix="sc-"), "scene.png"); img.save(path, "PNG"); return path
+# ---- compositor correction for job 863b478926: fringe-aware removal, texture, continuity, bounded shading, recomposite ----
+from PIL import ImageFilter as _IF
+def fringe_count(img, mask_L):
+    gate, _ = _c.chroma_gate(img, mask_L, margin_min=_c.FRINGE_QA_MARGIN_MIN); box = _c._work_box(mask_L); L = mask_L.crop(box)
+    return _c._count(ImageChops.multiply(gate.crop(box), ImageChops.subtract(_c._dil(L, 4), L)))
+def tex_energy(img, mask_L):
+    lum = img.convert("L"); hp = ImageChops.difference(lum, lum.filter(_IF.GaussianBlur(2))); v, _, _ = _c._mean_std(hp, mask_L); return v
+BLACK = [{"blank": "Unisex Heavy Cotton Tee", "provider": "Printify Choice", "color": "Black", "garment_rgb": [20, 20, 22], "spec_source": "fixture"}]
+# F1 anti-aliased fringe on a black garment: the removal mask grows only into tinted pixels (<= 3 px), and the final shows no visible perimeter
+for beh, label in (("fringe", "smooth black"), ("fringe_grain", "textured black")):
+    sc = _pv.draw_scene("1024x1024", (20, 20, 22), 1, behaviour=beh); comp, info = _c.isolate_marker(sc); grown, ginfo = _c.grow_removal_mask(sc, comp)
+    gL, cL = grown.convert("L"), comp.convert("L")
+    assert ginfo["grown_pixels"] > 0 and len(ginfo["passes"]) <= 3, ginfo
+    assert _c._count(ImageChops.multiply(gL, ImageChops.invert(_c._dil(cL, 3)))) == 0, "grew beyond 3 px"
+    before = fringe_count(sc, cL); assert before > 200, before
+    e = Env(); final, pl = _c.composite(open(_scene_png(sc), "rb").read(), e.staged_path, (20, 20, 22))
+    after = fringe_count(final, gL); assert after == 0, (label, after)
+    assert _c._count(gL) < _c._count(_c._dil(cL, 3)), "blind dilation"
+    print(f" F1-{beh}. PASS {label}: fringe removed by gated growth ({ginfo['grown_pixels']} px, passes {ginfo['passes']}); {before} visible fringe px before, 0 after; not a blind dilation"); e.done()
+# F2 texture restoration and continuity: textured black fabric regains high-frequency energy; smooth black stays smooth; interior mean within tolerance
+for beh, expect_tex in (("fringe_grain", True), ("fringe", False)):
+    sc = _pv.draw_scene("1024x1024", (20, 20, 22), 1, behaviour=beh); base, shade, mask, rinfo = _c.prepare_base(sc, None); L = mask.convert("L")
+    band = ImageChops.subtract(_c._dil(L, 9), _c._dil(L, 3)); inner = _c._ero(L, 10); tb, ti = tex_energy(sc, band), tex_energy(base, inner)
+    if expect_tex: assert ti >= 0.5 * tb and rinfo["texture"]["patches"] > 0, (tb, ti, rinfo["texture"])
+    else: assert ti <= max(0.6, tb + 0.3), (tb, ti)
+    assert rinfo["continuity"]["ok"] and abs(rinfo["continuity"]["delta"]) <= rinfo["continuity"]["tolerance"], rinfo["continuity"]
+    assert _c.marker_pixels(Image.composite(base, Image.new("RGB", base.size, (0, 0, 0)), L)) == 0
+    print(f" F2-{beh}. PASS texture band {tb:.2f} → interior {ti:.2f}; continuity delta {rinfo['continuity']['delta']} within {rinfo['continuity']['tolerance']}")
+# F2b no rectangular reconstruction panel: no luminance step across the repaired boundary and no chroma on either side of it
+sc = _pv.draw_scene("1024x1024", (20, 20, 22), 1, behaviour="fringe_grain"); base, _, mask, rinfo = _c.prepare_base(sc, None); L = mask.convert("L")
+band = ImageChops.subtract(_c._dil(L, 9), _c._dil(L, 3)); edge_in = ImageChops.subtract(L, _c._ero(L, 3)); edge_out = ImageChops.subtract(_c._dil(L, 3), L)
+bm, bs, _ = _c._mean_std(sc.convert("L"), band); ei, _, _ = _c._mean_std(base.convert("L"), edge_in); eo, _, _ = _c._mean_std(base.convert("L"), edge_out)
+assert abs(ei - eo) <= max(1.0, bs), (ei, eo, bs)
+assert fringe_count(base, L) == 0 and _c._count(ImageChops.multiply(_c.chroma_gate(base, L)[0], edge_in)) == 0
+print(" F2b. PASS no rectangular panel: no luminance step across the repaired boundary, no chroma on either side of it")
+# F3 continuity fails closed: a reconstruction that lands off the band is rejected (forced by patching the fill)
+real_recon = _c.reconstruct_garment
+def dark_recon(scene, mask, bbox):
+    out = real_recon(scene, mask, bbox); return Image.composite(out.point(lambda v: max(0, v - 12)), out, mask.convert("L"))
+_c._BASE_CACHE.clear(); _c.reconstruct_garment = dark_recon
+try:
+    _c.composite(open(_scene_png(sc), "rb").read(), Env().staged_path, (20, 20, 22)); raise AssertionError("continuity did not fail closed")
+except _c.CompositeError as ce: assert ce.code == "UNUSABLE_SCENE" and "not continuous" in ce.detail, ce.detail
+finally: _c.reconstruct_garment = real_recon; _c._BASE_CACHE.clear()
+print(" F3. PASS continuity check fails closed when the reconstructed interior drifts from the clean band")
+# F4 exact artwork fidelity: art pixels only moved and lit; alpha untouched; final recomposites byte-exact; opaque art equals art x shade exactly
+e, p = Env(), provider(script=["fringe_grain"]); o = run(e, evidence(product_candidates=BLACK), AUTH, p)
+def fidelity(o, e):
+    m = json.load(open(os.path.join(e.C, "1901-093/manifest.json"))); pl = m["scene_slots"][0]["placement"]; assert pl["compositor_version"] == _c.COMPOSITOR_VERSION and m["rendering"]["compositor_version"] == _c.COMPOSITOR_VERSION
+    sc = Image.open(os.path.join(e.C, "1901-093/generated-scenes/01-hero-base.png")).convert("RGB"); fin = Image.open(os.path.join(e.C, "1901-093/final-composites/01-hero.png")).convert("RGB"); art = Image.open(e.staged_path)
+    assert ImageChops.difference(fin, _c.render_from_placement(sc, art, pl)).getbbox() is None
+    base, shade, mask, rinfo = _c.prepare_base(sc, pl); alpha = _c.warped_alpha(sc.size, art, pl); opaque = alpha.point(lambda v: 255 if v == 255 else 0)
+    coeffs = _c.perspective_coeffs([tuple(q) for q in pl["art_quad"]], art.size[0], art.size[1]); warped = art.convert("RGBA").transform(sc.size, Image.PERSPECTIVE, coeffs, resample=Image.BICUBIC).convert("RGB")
+    expect = ImageChops.multiply(warped, Image.merge("RGB", (shade, shade, shade))); diff = ImageChops.difference(Image.composite(fin, Image.new("RGB", sc.size), opaque), Image.composite(expect, Image.new("RGB", sc.size), opaque))
+    assert diff.getbbox() is None, "opaque art pixels were blended with the garment"
+    q = json.load(open(os.path.join(e.C, "1901-093/qa/qa.json")))["images"][0]["checks"]; bad = {k: q[k]["detail"] for k in q if q[k]["result"] == "FAIL"}; assert not bad, bad
+    assert all(k in q for k in ("no_marker_fringe", "reconstruction_continuity", "garment_texture_restored", "bounded_shading"))
+T("F4", "black textured garment with fringe: full run; art only moved and lit; opaque stays opaque; new QA checks PASS", o, "READY_FOR_HUMAN_RENDER_REVIEW", True, e, p, calls=6, extra=fidelity)
+# F5 dark-garment shading rule: floor <= min <= median <= 1, low-frequency source, white outside the print area; black is modulated less than the old rule would
+for col, beh in (((20, 20, 22), "fringe_grain"), ((8, 8, 10), "grain"), ((72, 70, 68), "ok"), ((200, 200, 196), "ok")):
+    sc = _pv.draw_scene("1024x1024", col, 1, behaviour=beh); _, shade, mask, rinfo = _c.prepare_base(sc, None); sh = rinfo["shading"]
+    assert sh["floor_effective"] - 1e-9 <= sh["min_modulation"] <= sh["median_modulation"] <= 1.0 and sh["source"] == "low-frequency reconstruction only", sh
+    assert _c._count(ImageChops.multiply(shade.point(lambda v: 255 if v < 255 else 0), ImageChops.invert(mask.convert("L")))) == 0, "shading leaked outside the print area"
+print(" F5. PASS bounded shading: floor <= min <= median <= 1 on black, near-black, mid and light garments; white outside the print area")
+# F6 no regression: the fringe fixture still isolates one component with fill >= 0.95 and its ring is still accepted
+sc = _pv.draw_scene("1024x1024", (20, 20, 22), 1, behaviour="fringe"); q_, info = _c.find_marker_quad(sc); assert q_ and info["components"]["plausible"] == 1 and info["fill_ratio"] >= 0.95
+st = _c.ring_stats(sc, _c.grow_removal_mask(sc, _c.isolate_marker(sc)[0])[0]); assert _c.ring_acceptable(st)[0]
+print(" F6. PASS marker detection and ring validation unchanged under the fringe fixture")
+# F7 determinism: the same scene twice gives byte-identical base and shade (quilting is seeded from the marker-free image)
+_c._BASE_CACHE.clear(); b1, s1, _, i1 = _c.prepare_base(sc, None); _c._BASE_CACHE.clear(); b2, s2, _, i2 = _c.prepare_base(sc, None)
+assert ImageChops.difference(b1, b2).getbbox() is None and ImageChops.difference(s1, s2).getbbox() is None and i1 == i2
+print(" F7. PASS reconstruction is a pure, deterministic function of the scene")
+# ---- recomposite / supersession ----
+RC_AUTH = "AUTHORIZE LISTING RECOMPOSITE 1901-093"; RC_ASK = "Recomposite the 1901-093 campaign with the corrected compositor."
+def old_package(e, p=None):
+    p = p or provider(script=["fringe_grain"] * 6); o = run(e, evidence(product_candidates=BLACK), AUTH, p, jid="origjob001"); assert o["result"] == "READY_FOR_HUMAN_RENDER_REVIEW", o["checks"][-1]
+    mp = os.path.join(e.C, "1901-093/manifest.json"); m = json.load(open(mp)); m["rendering"]["compositor_version"] = "old"; json.dump(m, open(mp, "w"), indent=2)
+    return {f: open(os.path.join(e.C, f), "rb").read() for f in e.tree()}
+def rc(e, msg, **kw): return job.recomposite("1901-093", msg, e.H, e.C, now=NOW, **kw)
+e = Env(); snap_ = old_package(e); o = rc(e, RC_ASK)
+assert o["result"] == "AWAITING_RECOMPOSITE_AUTHORIZATION" and o["recomposite_performed"] is False and o["render_job_id"] == "origjob001-rc1" and o["supersedes"]["render_job_id"] == "origjob001" and o["generation_calls"] == 0 and "AUTHORIZE LISTING RECOMPOSITE 1901-093" in o["human_action_required"], o["checks"][-1]
+assert {f: open(os.path.join(e.C, f), "rb").read() for f in e.tree()} == snap_ and not any(d.startswith(".tmp-") or d.startswith("_superseded") for d in e.dirs()); examples["RC1"] = o
+assert rc(e, "Proceed.")["result"] == "AWAITING_RECOMPOSITE_AUTHORIZATION" and rc(e, "AUTHORIZE LISTING RECOMPOSITE 1901-094")["result"] == "AWAITING_RECOMPOSITE_AUTHORIZATION"
+assert rc(e, "AUTHORIZE LISTING RENDER 1901-093")["result"] == "AWAITING_RECOMPOSITE_AUTHORIZATION", "the render command must not authorize a recomposite"
+print(" RC1. PASS recomposite proposal: nothing changed; the render command, vague words and another id never authorize it")
+o = rc(e, RC_AUTH); assert o["result"] == "READY_FOR_HUMAN_RENDER_REVIEW" and o["recomposite_performed"] is True, o["checks"][-1]
+sup = os.path.join(e.C, "_superseded/1901-093-origjob001"); rec = json.load(open(sup + ".SUPERSEDED.json")); newm = json.load(open(os.path.join(e.C, "1901-093/manifest.json")))
+assert os.path.isdir(sup) and all(open(os.path.join(sup, f[len("1901-093/"):]), "rb").read() == b for f, b in snap_.items()), "superseded package not byte-identical"
+assert rec["render_job_id"] == "origjob001" and rec["superseded_by"] == "origjob001-rc1" and rec["original_result"] == "READY_FOR_HUMAN_RENDER_REVIEW" and rec["original_final_sha256"] == json.loads(snap_["1901-093/manifest.json"])["final_sha256"]
+r_ = newm["recomposite"]; assert r_["of_render_job_id"] == "origjob001" and r_["generation_calls"] == 0 and r_["estimated_api_cost_usd"] == 0.0 and r_["superseded_package"] == "_superseded/1901-093-origjob001" and r_["source_sha256"] == e.sha and len(r_["base_scenes_reused"]) == 6 and r_["original_final_sha256"] == rec["original_final_sha256"]
+assert newm["render_job_id"] == "origjob001-rc1" and newm["rendering"]["compositor_version"] == _c.COMPOSITOR_VERSION and newm["rendering"]["compositor_commit"] == job.compositor_commit() and newm["publication_authorized"] is False and newm["final_sha256"] == rec["original_final_sha256"]   # same compositor in the fixture: a recomposite reproduces the finals byte-for-byte (determinism)
+for n_ in newm["generated_scenes"]: assert open(os.path.join(e.C, "1901-093/generated-scenes", n_), "rb").read() == snap_["1901-093/generated-scenes/" + n_]
+cl = json.load(open(os.path.join(e.C, "1901-093/cost-log.json"))); assert cl["images_generated"] == 0 and cl["generation_calls"] == 0 and cl["estimated_api_cost_usd"] == 0.0 and cl["recomposite_of_render_job_id"] == "origjob001"
+assert os.path.isfile(os.path.join(e.C, "1901-093/source/recomposite-reference.json")) and json.load(open(os.path.join(e.C, "1901-093/qa/qa.json")))["campaign_result"] == "PASS" and not any(d.startswith(".tmp-") for d in e.dirs())
+examples["RC2"] = o; print(" RC2. PASS authorized recomposite: original moved whole and byte-identical to _superseded with a SUPERSEDED record; new package carries the recomposite block, zero generation, zero spend")
+o = rc(e, RC_AUTH); assert o["result"] == "ALREADY_CURRENT" and o["recomposite_performed"] is False
+o = run(e, evidence(product_candidates=BLACK), AUTH, provider(), jid="x"); assert o["result"] == "ALREADY_RENDERED" and o["render_job_id"] == "origjob001-rc1"
+print(" RC3. PASS a second recomposite is ALREADY_CURRENT; a render request on the new package is ALREADY_RENDERED; no call made"); e.done()
+# RC4 a scene the corrected compositor cannot use fails closed: nothing moved, nothing published
+e = Env(); old_package(e); _pv.draw_scene("1024x1024", (20, 20, 22), 3, behaviour="no_marker").save(os.path.join(e.C, "1901-093/generated-scenes/03-travel-base.png"), "PNG"); snap_ = {f: open(os.path.join(e.C, f), "rb").read() for f in e.tree()}
+o = rc(e, RC_AUTH); assert o["result"] == "RECOMPOSITE_FAILED" and o["recomposite_performed"] is False and {f: open(os.path.join(e.C, f), "rb").read() for f in e.tree()} == snap_ and not os.path.isdir(os.path.join(e.C, "_superseded")) and not any(d.startswith(".tmp-") for d in e.dirs())
+print(" RC4. PASS unusable stored scene: RECOMPOSITE_FAILED, original package untouched, no temp left"); e.done()
+# RC5 source drift: the staged handoff no longer matches the package source
+e = Env(); old_package(e); hm = os.path.join(e.H, "1901-093/manifest.json"); hmj = json.load(open(hm)); hmj["source"]["sha256"] = "0" * 64; json.dump(hmj, open(hm, "w"))
+o = rc(e, RC_AUTH); assert o["result"] == "SOURCE_MISMATCH" and not os.path.isdir(os.path.join(e.C, "_superseded")); print(" RC5. PASS source drift blocks the recomposite"); e.done()
+# RC6 no package / missing base scene
+e = Env(); assert rc(e, RC_AUTH)["result"] == "CAMPAIGN_NOT_FOUND"; old_package(e); os.remove(os.path.join(e.C, "1901-093/generated-scenes/02-story-base.png")); assert rc(e, RC_AUTH)["result"] == "CAMPAIGN_CONFLICT"; e.done()
+print(" RC6. PASS missing package or missing base scene fails closed")
 print("ALL PATCH TESTS PASS")
 if "--dump" in sys.argv:
-    for n in (1, 2, 4, 14, 13, 22, 23, 8, 9, 11, 18, 19, 20, "M4", "R1"):
+    for n in (1, 2, 4, 14, 13, 22, 23, 8, 9, 11, 18, 19, 20, "M4", "R1", "RC1", "RC2"):
         open(os.path.join(HERE, f"ex{n}.json"), "w").write(json.dumps(examples[n], indent=1, ensure_ascii=False) + "\n")

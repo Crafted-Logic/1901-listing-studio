@@ -37,7 +37,8 @@ def main():
             cleaned = Image.composite(Image.new("RGB", scene.size, (40, 40, 40)), scene, other)
             quad2, info2 = compositor.find_marker_quad(cleaned)
             assert quad2 == quad and info2["pixels"] == info["pixels"] and info2["components"]["ignored_pixels"] == 0, (name, "background pixels influenced the quad")
-            ring = compositor.ring_stats(scene, mask)
+            removal, _g = compositor.grow_removal_mask(scene, mask)
+            ring = compositor.ring_stats(scene, removal)                 # the ring is measured outside the fringe-aware removal mask, as the compositor does
             ring_ok, ring_why, ring_rule = compositor.ring_acceptable(ring)
             assert ring_ok, (name, ring, ring_why)                       # dark-garment rule (review after 735f67d): all five real black-shirt rings are reconstructable
             final, placement = compositor.composite(open(path, "rb").read(), ART, PRODUCT["garment_rgb"])
@@ -47,7 +48,10 @@ def main():
             det = {k: v for k, v in checks.items() if v["method"] == "deterministic"}
             failed = [k for k, v in det.items() if v["result"] != "PASS"]
             assert result == "PASS" and not failed and placement["placeholder"]["fill_ratio"] == info["fill_ratio"] and placement["ring"]["rule"] == ring_rule, (name, failed, {k: det[k]["detail"] for k in failed})
-            outcome = f"ring {ring_rule} (mean {ring['mean_luminance']}, std {ring['std']}, cv {ring['cv']}, texture {ring['texture']}); composite+QA {result} (scale {placement['scale']})"
+            rec = placement["reconstruction"]
+            assert rec["continuity"]["ok"] and rec["texture"]["patches"] > 0 and rec["removal"]["grown_pixels"] > 0 and len(rec["removal"]["passes"]) <= 3, rec
+            assert checks["no_marker_fringe"]["result"] == "PASS" and checks["bounded_shading"]["result"] == "PASS", checks["no_marker_fringe"]["detail"]
+            outcome = f"ring {ring_rule}; fringe grown {rec['removal']['grown_pixels']} px; continuity {rec['continuity']['delta']:+} (tol {rec['continuity']['tolerance']}); shade med {rec['shading']['median_modulation']} min {rec['shading']['min_modulation']}; composite+QA {result}"
             rows.append((name, PRE_PATCH[name], info["fill_ratio"], info["pixels"], comp["total"], comp["ignored_pixels"], outcome))
         print(f"{'scene':24} {'pre-patch fill':>14} {'fill now':>9} {'marker px':>10} {'comps':>6} {'ignored px':>10}  outcome")
         for r in rows:
@@ -57,7 +61,7 @@ def main():
         shutil.rmtree(tmp, ignore_errors=True)
     after = sorted(os.path.join(d, f) for d, _, fs in os.walk(config.CAMPAIGN_ROOT) for f in fs)
     assert after == before and all(os.stat(p).st_mtime_ns == stat_before[p] for p in before), "campaign root changed"
-    assert not os.path.isdir(os.path.join(config.CAMPAIGN_ROOT, "1901-093")), "a final campaign folder appeared"
+    assert sorted(os.listdir(config.CAMPAIGN_ROOT)) == sorted(set(p.split(os.sep)[len(config.CAMPAIGN_ROOT.rstrip(os.sep).split(os.sep))] for p in before)), "a new top-level entry appeared in the campaign root"
     print("REGRESSION PASS: five chest markers isolated (one plausible component each), all >= 0.85 fill, background chroma does not move the quad; all five rings accepted (dark-garment rule) and every composite passes deterministic QA; campaign root unchanged; no provider constructed, no generation call")
     return 0
 

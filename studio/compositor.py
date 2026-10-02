@@ -10,7 +10,7 @@ The exact approved artwork is fitted inside the quad with its aspect ratio prese
 perspective transform, and lit by multiplying the reconstructed garment luminance. Pixels of the
 art are only moved and lit; never redrawn. Every step is a pure function of (scene, art, placement)
 so QA can recompute the composite and compare pixel-for-pixel."""
-import hashlib, io, math
+import hashlib, io, json, math
 from PIL import Image, ImageChops, ImageFilter
 
 from . import config
@@ -26,6 +26,18 @@ RING_DARK_MEAN_MAX = 28      # luminance mean at or below which the dark branch 
 RING_DARK_MAX_STD = 9.8      # absolute spread cap = exactly what cv 0.35 allows at mean 28 (0.35*28); real evidence max 9.12
 RING_DARK_MAX_TEXTURE = 5    # mean |L - blur(L, 2)| on the ring: random mottle >= +-12 scores >= 5.4; real fabric <= 3.2
 MARKER_DOMINANCE = 4.0   # the chest marker must be at least this many times larger than any other plausible component
+COMPOSITOR_VERSION = "2026-10-02.3"   # fringe-aware removal + converged harmonic fill + quilted texture + continuity + bounded shading
+FRINGE_MAX_GROW_PX = 3       # the removal mask may grow at most this far beyond the marker component
+FRINGE_MARGIN_MIN = 6.0      # chroma margin (levels) over the clean band's (R-G, B-G); 3x the band's chroma std when larger
+FRINGE_QA_MARGIN_MIN = 12.0  # QA counts only VISIBLY tinted pixels (twice the removal margin); removal is deliberately more aggressive than the check
+FRINGE_MAX_RATE = 0.002      # QA: marker-tinted pixels allowed in the 0-4 px band of the final, as a fraction of that band (plus the clean band's own rate)
+RELAX_MAX_ITERS = 3000       # harmonic fill: Gauss-Seidel until the largest update is below RELAX_TOL (converges in ~100-250 passes on a 56-cell grid)
+RELAX_TOL = 0.005
+TEXTURE_PATCH = 6            # quilting: residual patches this size, sampled from the ring, overlapped by TEXTURE_OVERLAP and ramp-blended
+TEXTURE_OVERLAP = 2
+CONTINUITY_TOL_ABS = 1.0     # luminance levels; |interior mean - clean band mean| must not exceed max(abs, rel * band mean)
+CONTINUITY_TOL_REL = 0.06
+SHADE_FLOOR = 0.70           # bounded dark-garment modulation: the print is never darkened below this fraction of its source intensity
 
 
 def marker_mask(img):
@@ -118,6 +130,53 @@ def _isolate_marker(img):
                            "dominance": round(sel["pixels"] / float(candidates[1]["pixels"]), 2) if len(candidates) > 1 else None,
                            "selection": "largest component by pixel count; sub-minimum components are background noise"}}
     return comp, info
+
+
+def _dil(L, k): return L.filter(ImageFilter.MaxFilter(2 * k + 1)) if k else L
+def _ero(L, k): return L.filter(ImageFilter.MinFilter(2 * k + 1)) if k else L
+def _count(L): return sum(L.point(lambda v: 1 if v else 0).histogram()[1:])
+
+
+def _mean_std(ch, mask):
+    """Mean and std of an L channel over mask pixels (mask L 0/255). Values are offset by +1 so 0 is counted."""
+    hh = ImageChops.multiply(ch.point(lambda v: min(255, v + 1)), mask).histogram()[1:]; n = sum(hh)
+    if not n: return None, None, 0
+    mean = sum(i * k for i, k in enumerate(hh)) / n
+    return mean, math.sqrt(sum(k * (i - mean) ** 2 for i, k in enumerate(hh)) / n), n
+
+
+def _work_box(mask_L, pad=24):
+    """Crop box around the mask with padding: every band/dilation operation runs on this crop, not the full image."""
+    bb = mask_L.getbbox(); w, h = mask_L.size
+    if not bb: return (0, 0, w, h)
+    return (max(0, bb[0] - pad), max(0, bb[1] - pad), min(w, bb[2] + pad), min(h, bb[3] + pad))
+
+
+def chroma_gate(scene, mask_L, margin_min=FRINGE_MARGIN_MIN):
+    """Marker-tinted test relative to the clean garment band 4-9 px outside the mask: a pixel is tinted when both
+    R-G and B-G exceed the band's mean by a margin (margin_min, or 3x the band's chroma std when larger).
+    Returns (gate L, full image size, zero outside the work crop; info)."""
+    box = _work_box(mask_L); ml = mask_L.crop(box)
+    r, g, b = scene.convert("RGB").crop(box).split(); rg = ImageChops.subtract(r, g); bg = ImageChops.subtract(b, g)
+    band = ImageChops.subtract(_dil(ml, 9), _dil(ml, 3))
+    mrg, srg, _ = _mean_std(rg, band); mbg, sbg, _ = _mean_std(bg, band)
+    gate = Image.new("L", scene.size, 0)
+    if mrg is None: return gate, {"reference_rg": None, "reference_bg": None, "chroma_std": None, "margin": None}
+    margin = max(margin_min, 3.0 * max(srg, sbg)); tr, tb = mrg + margin, mbg + margin
+    gate.paste(ImageChops.multiply(rg.point(lambda v, t=tr: 255 if v > t else 0), bg.point(lambda v, t=tb: 255 if v > t else 0)), box)
+    return gate, {"reference_rg": round(mrg, 2), "reference_bg": round(mbg, 2), "chroma_std": round(max(srg, sbg), 2), "margin": round(margin, 2)}
+
+
+def grow_removal_mask(scene, component_mask):
+    """Fringe-aware removal mask: the marker component grown by at most FRINGE_MAX_GROW_PX, one pixel per pass, only into
+    4-neighbours that the relative chroma gate marks as marker-tinted. Never a blind dilation. Returns (mask '1', info)."""
+    L = component_mask.convert("L"); gate, ginfo = chroma_gate(scene, L); box = _work_box(L); cur = L.crop(box); g = gate.crop(box); added = []
+    for _ in range(FRINGE_MAX_GROW_PX):
+        new = ImageChops.multiply(ImageChops.subtract(_dil(cur, 1), cur), g); n = _count(new); added.append(n)
+        if n == 0: break
+        cur = ImageChops.lighter(cur, new)
+    full = Image.new("L", L.size, 0); full.paste(cur, box)
+    return full.convert("1"), {"grown_pixels": sum(added), "passes": added, "max_grow_px": FRINGE_MAX_GROW_PX, "gate": ginfo}
 
 
 def find_marker_quad(img):
@@ -250,14 +309,14 @@ def reconstruct_garment(scene, mask, bbox):
         for y in range(gh):
             for x in range(gw):
                 if unknown[y][x]: f[y][x] = seed
-        for _ in range(400):                                   # Gauss-Seidel Laplace relaxation; deterministic order
+        for _ in range(RELAX_MAX_ITERS):                       # Gauss-Seidel Laplace relaxation to convergence; deterministic order
             delta = 0.0
             for y in range(gh):
                 for x in range(gw):
                     if unknown[y][x]:
                         nb = [f[yy][xx] for yy, xx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)) if 0 <= yy < gh and 0 <= xx < gw]
                         v = sum(nb) / len(nb); delta = max(delta, abs(v - f[y][x])); f[y][x] = v
-            if delta < 0.05: break
+            if delta < RELAX_TOL: break
         fields.append(Image.new("L", (gw, gh)).copy())
         fields[-1].putdata([max(0, min(255, int(round(f[y][x])))) for y in range(gh) for x in range(gw)])
     filled = Image.merge("RGB", fields).resize((rw, rh), Image.BILINEAR)
@@ -266,25 +325,123 @@ def reconstruct_garment(scene, mask, bbox):
     return out
 
 
+def _lcg(seed):
+    """Deterministic pseudo-random generator (32-bit LCG); seeded from the scene bytes so the result is a pure function of the scene."""
+    state = seed & 0xffffffff
+    while True:
+        state = (state * 1103515245 + 12345) & 0x7fffffff
+        yield state
+
+
+def restore_texture(scene, low, mask):
+    """Deterministic high-frequency garment texture under the mask: the residual (pixel minus 2 px blur) of the ring 1-9 px
+    outside the mask, on the scene with the low-frequency fill already in place, is quilted into the interior as
+    TEXTURE_PATCH-sized patches taken at pseudo-random positions along the ring (seeded from the marker-free image) and
+    ramp-blended over TEXTURE_OVERLAP pixels. Returns (textured image, info). Pure function of (scene, low, mask)."""
+    L = mask.convert("L"); bbox = L.getbbox()
+    if not bbox: return low, {"patches": 0}
+    pad = RING + 4; w, h = low.size
+    X0, Y0, X1, Y1 = max(0, bbox[0] - pad), max(0, bbox[1] - pad), min(w, bbox[2] + pad), min(h, bbox[3] + pad)
+    region = low.crop((X0, Y0, X1, Y1)).convert("RGB"); rm = L.crop((X0, Y0, X1, Y1)); W, H = region.size
+    blur = region.filter(ImageFilter.GaussianBlur(2))
+    res = [ImageChops.subtract(a, b, 1, 128) for a, b in zip(region.split(), blur.split())]      # signed residual, +128 offset
+    ring = ImageChops.subtract(_dil(rm, RING), rm)
+    P, O = TEXTURE_PATCH, TEXTURE_OVERLAP
+    ring_ok = ring.filter(ImageFilter.MinFilter(P + 1 if P % 2 == 0 else P))                     # pixels whose P x P footprint lies entirely in the ring (odd window, conservative)
+    rp = ring_ok.load(); half = P // 2
+    sources = [(x, y) for y in range(half, H - half) for x in range(half, W - half) if rp[x, y]]  # raster order: deterministic
+    if len(sources) < 8: return low, {"patches": 0, "reason": "ring too thin to sample texture"}
+    seed = int(hashlib.sha1(low.tobytes()).hexdigest()[:8], 16); rnd = _lcg(seed)      # seeded from the scene with the marker already replaced: marker pixel values never influence the composite
+    rpx = [r.load() for r in res]; mp = rm.load(); out = region.copy(); op = out.load(); lp = region.load()
+    acc = {}                                                                                      # (x,y) -> [sum_r, sum_g, sum_b, weight]
+    step = P - O
+    for ty in range(0, H, step):
+        for tx in range(0, W, step):
+            if not any(mp[x, y] for y in range(ty, min(H, ty + P)) for x in range(tx, min(W, tx + P))): continue
+            sx, sy = sources[next(rnd) % len(sources)]; sx -= half; sy -= half
+            for dy in range(P):
+                y = ty + dy
+                if y >= H: break
+                wy = min(dy + 1, P - dy, O + 1) / float(O + 1)
+                for dx in range(P):
+                    x = tx + dx
+                    if x >= W: break
+                    if not mp[x, y]: continue
+                    wgt = wy * (min(dx + 1, P - dx, O + 1) / float(O + 1))
+                    a = acc.get((x, y))
+                    if a is None: a = acc[(x, y)] = [0.0, 0.0, 0.0, 0.0]
+                    for ch in range(3): a[ch] += wgt * (rpx[ch][sx + dx, sy + dy] - 128)
+                    a[3] += wgt
+    for (x, y), (sr, sg, sb, wt) in acc.items():
+        base_px = lp[x, y]; op[x, y] = tuple(max(0, min(255, int(round(base_px[ch] + (sr, sg, sb)[ch] / wt)))) for ch in range(3))
+    full = low.copy(); full.paste(out, (X0, Y0))
+    return full, {"patches": len(acc) and (len(range(0, H, step)) * len(range(0, W, step))), "patch": P, "overlap": O, "sources": len(sources), "seed": seed}
+
+
+def continuity(scene, base, mask):
+    """Luminance continuity of the reconstructed interior (mask eroded by 10 px) against the clean garment band 4-9 px
+    outside the mask. Returns (ok, info)."""
+    L = mask.convert("L"); box = _work_box(L); ml = L.crop(box); band = ImageChops.subtract(_dil(ml, 9), _dil(ml, 3)); inner = _ero(ml, 10)
+    bm, _, nb = _mean_std(scene.convert("L").crop(box), band); im, _, ni = _mean_std(base.convert("L").crop(box), inner)
+    if bm is None or im is None or ni < 100:
+        return False, {"band_mean": bm, "interior_mean": im, "delta": None, "tolerance": None, "detail": "interior or band too small to compare"}
+    tol = max(CONTINUITY_TOL_ABS, CONTINUITY_TOL_REL * bm); delta = im - bm
+    return abs(delta) <= tol, {"band_mean": round(bm, 2), "interior_mean": round(im, 2), "delta": round(delta, 2), "tolerance": round(tol, 2)}
+
+
+def shading_map(low, mask):
+    """Bounded illumination map from the LOW-FREQUENCY reconstructed field only (fabric texture never prints through the
+    ink): shade = low / p95(low over the print area), floored at SHADE_FLOOR, 1.0 elsewhere. Returns (L map, info)."""
+    L = mask.convert("L"); lum = low.convert("L")
+    hh = ImageChops.multiply(lum.point(lambda v: min(255, v + 1)), L).histogram()[1:]; n = sum(hh); cum = 0; p95 = 255
+    for i, k in enumerate(hh):
+        cum += k
+        if cum >= 0.95 * n: p95 = max(1, i); break
+    floor = int(round(SHADE_FLOOR * 255))
+    shade = lum.point(lambda v, p=p95: max(floor, min(255, int(round(255 * v / p)))))
+    shade = Image.composite(shade, Image.new("L", low.size, 255), L)
+    sh = ImageChops.multiply(shade, L).histogram()[1:]; ns = sum(sh); cum = 0; med = None; mn = None
+    for i, k in enumerate(sh):
+        if k and mn is None: mn = i + 1
+        cum += k
+        if med is None and cum >= ns / 2: med = i + 1
+    return shade, {"reference_p95": p95, "floor": SHADE_FLOOR, "floor_effective": round(floor / 255, 3), "median_modulation": round((med or 255) / 255, 3), "min_modulation": round((mn or 255) / 255, 3), "source": "low-frequency reconstruction only"}
+
+
+_BASE_CACHE = {}
+
+
 def prepare_base(scene, placement):
-    """Scene with the marker removed and the garment reconstructed under it, plus the shading map
-    (L, white outside the marker) derived from the reconstruction, never from the marker."""
-    scene = scene.convert("RGB"); mask, _ = isolate_marker(scene)          # the chest-marker component only; background chroma is untouched
-    if mask is None: raise CompositeError("UNUSABLE_SCENE", _)
-    base = reconstruct_garment(scene, mask, tuple(placement["placeholder"]["bbox"]))
-    lum = base.convert("L")
-    hist = ImageChops.multiply(lum, mask.convert("L")).histogram()[1:]
-    peak = max((i + 1 for i, c in enumerate(hist) if c), default=255)
-    shade = lum.point(lambda v, p=peak: max(64, min(255, int(255 * v / p))))
-    shade = Image.composite(shade, Image.new("L", scene.size, 255), mask.convert("L"))
-    return base, shade, mask
+    """Scene with the marker (and its chroma fringe) removed and the garment reconstructed under it: converged harmonic
+    low-frequency field plus quilted ring texture; and the bounded shading map (L, white outside the marker) from the
+    low-frequency field only. Pure function of the scene (placement is not read). Returns (base, shade, removal mask, info)."""
+    scene = scene.convert("RGB")
+    key = (scene.size, hashlib.sha1(scene.tobytes()).hexdigest())
+    hit = _BASE_CACHE.get(key)
+    if hit is not None: return hit[0].copy(), hit[1].copy(), hit[2].copy(), json.loads(json.dumps(hit[3]))
+    result = _prepare_base(scene)
+    if len(_BASE_CACHE) > 16: _BASE_CACHE.clear()
+    _BASE_CACHE[key] = result
+    return result[0].copy(), result[1].copy(), result[2].copy(), json.loads(json.dumps(result[3]))
+
+
+def _prepare_base(scene):
+    comp, why = isolate_marker(scene)          # the chest-marker component only; background chroma is untouched
+    if comp is None: raise CompositeError("UNUSABLE_SCENE", why)
+    mask, ginfo = grow_removal_mask(scene, comp)
+    low = reconstruct_garment(scene, mask, mask.convert("L").getbbox())
+    base, tinfo = restore_texture(scene, low, mask)
+    ok, cinfo = continuity(scene, base, mask)
+    shade, sinfo = shading_map(low, mask)
+    return base, shade, mask, {"removal": ginfo, "texture": tinfo, "continuity": {"ok": ok, **cinfo}, "shading": sinfo}
 
 
 def composite(scene_png_bytes, art_png_path, garment_rgb):
     scene = Image.open(io.BytesIO(scene_png_bytes)).convert("RGB")
     quad, info = find_marker_quad(scene)
     if quad is None: raise CompositeError("UNUSABLE_SCENE", info)
-    stats = ring_stats(scene, isolate_marker(scene)[0])
+    comp = isolate_marker(scene)[0]; removal, _ = grow_removal_mask(scene, comp)
+    stats = ring_stats(scene, removal)                                     # the ring is measured outside the fringe-aware removal mask
     ok, why, rule = ring_acceptable(stats)
     if not ok:
         raise CompositeError("UNUSABLE_SCENE", f"local garment field cannot be reconstructed: {why}")
@@ -297,16 +454,24 @@ def composite(scene_png_bytes, art_png_path, garment_rgb):
         raise CompositeError("RESOLUTION_BLOCK", f"the print area would need the art at {fitted_w:.0f}px wide but the approved source is only {aw}px wide; compositing would upscale the art by {scale:.2f}x")
     placement = {"quad": [[round(x, 2), round(y, 2)] for x, y in quad], "art_quad": [[round(x, 2), round(y, 2)] for x, y in sub], "placeholder": info, "ring": stats, "art_size": [aw, ah], "art_mode": art_mode, "art_has_alpha": has_alpha,
                  "scale": round(scale, 4), "aspect_preserved": True, "rotation_deg": round(math.degrees(math.atan2(quad[1][1] - quad[0][1], quad[1][0] - quad[0][0])), 2), "garment_rgb": list(garment_rgb),
-                 "method": "marker-geometry + harmonic garment reconstruction + pillow-perspective + luminance-multiply"}
-    return render_from_placement(scene, art, placement), placement
+                 "method": "marker-geometry + harmonic garment reconstruction + ring-texture quilting + pillow-perspective + bounded-luminance-multiply", "compositor_version": COMPOSITOR_VERSION}
+    base, shade, removal, rinfo = prepare_base(scene, placement)
+    if not rinfo["continuity"]["ok"]:
+        raise CompositeError("UNUSABLE_SCENE", f"reconstructed garment is not continuous with its surroundings (interior {rinfo['continuity']['interior_mean']} vs band {rinfo['continuity']['band_mean']}, tolerance {rinfo['continuity']['tolerance']})")
+    placement["reconstruction"] = rinfo
+    return _render(base, shade, art, placement), placement
 
 
 def render_from_placement(scene, art, placement):
     """Pure function of (base scene, art, placement). QA calls this again to prove the final was not altered."""
-    base, shade, _ = prepare_base(scene, placement)
+    base, shade, _, _ = prepare_base(scene, placement)
+    return _render(base, shade, art, placement)
+
+
+def _render(base, shade, art, placement):
     art = art.convert("RGBA")
     coeffs = perspective_coeffs([tuple(p) for p in placement["art_quad"]], art.size[0], art.size[1])
-    warped = art.transform(scene.size, Image.PERSPECTIVE, coeffs, resample=Image.BICUBIC)
+    warped = art.transform(base.size, Image.PERSPECTIVE, coeffs, resample=Image.BICUBIC)
     rgb = ImageChops.multiply(warped.convert("RGB"), Image.merge("RGB", (shade, shade, shade)))
     warped = Image.merge("RGBA", (*rgb.split(), warped.split()[3]))
     return Image.alpha_composite(base.convert("RGBA"), warped).convert("RGB")

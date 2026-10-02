@@ -328,21 +328,50 @@ Two separate concerns, deliberately kept apart:
   fixtures; the spread cap is exactly what the ratio rule allows at mean 28. The
   placement records which rule admitted the ring (`ring.rule`).
 
-The compositor (`studio/compositor.py`, Pillow only, no model call) then:
+The compositor (`studio/compositor.py`, Pillow only, no model call,
+`COMPOSITOR_VERSION` recorded in every placement and manifest) then:
 
-1. removes the marker completely, replacing it with the reconstructed garment
-   field;
-2. derives the shading map from the reconstructed field's luminance (white
-   outside the marker);
-3. fits the art inside the marker quad preserving its aspect ratio exactly
+1. **removes the marker and its chroma fringe.** Generated scenes
+   anti-alias the marker edge over 1 to 3 px; those blended pixels fail the
+   strict marker colour but are visibly magenta. The removal mask is the
+   isolated component grown by at most 3 px, one pixel per pass, only into
+   4-neighbours that a relative chroma gate marks as marker-tinted: both
+   R−G and B−G above the clean garment band's (4 to 9 px out) mean by a
+   margin of 6 levels or three times that band's chroma spread. It is never
+   a blind dilation; untinted garment and background pixels are never
+   absorbed. The ring statistics and everything below use this mask;
+2. **reconstructs the garment under it**: the harmonic (Laplace) fill on a
+   downsampled grid is relaxed to convergence (largest update below 0.005,
+   never a fixed iteration count) so the low-frequency field matches the
+   surrounding garment, then the garment's own high-frequency texture is
+   restored by quilting: the residual (pixel minus a 2 px blur) of the ring
+   1 to 9 px outside the mask is copied into the interior as 6 px patches
+   taken at pseudo-random ring positions, seeded from the marker-free image, and
+   ramp-blended over 2 px overlaps. A pure deterministic function of the
+   scene: QA recomputes it exactly;
+3. **checks continuity**: the reconstructed interior's mean luminance (mask
+   eroded by 10 px) against the clean band 4 to 9 px out must agree within
+   `max(1.0, 6%)` levels, else the scene is unusable (reroll; in a
+   recomposite, failure). Recorded in `placement.reconstruction.continuity`;
+4. derives the **bounded shading map** from the low-frequency field only
+   (fabric texture never prints through the ink): `shade = low / p95(low
+   over the print area)`, floored at 0.70, white outside the marker.
+   Opaque ink on a dark garment is modulated by the garment's large-scale
+   lighting, never by its darkness: on the six 1901-093 scenes this moved
+   the print's median intensity from 0.67 to 0.91 of source under the old
+   `textured / max` rule to 0.76 to 0.96, with a hard floor at 0.70 instead
+   of 0.58;
+5. fits the art inside the marker quad preserving its aspect ratio exactly
    (never stretched), maps it by a perspective transform, multiplies the
    shading into it, and alpha-composites it over the reconstructed garment;
-   the art's alpha channel, if any, is used as-is;
-4. refuses to upscale: if the fitted width exceeds the art's width →
+   the art's RGB and alpha are otherwise untouched, so opaque art stays
+   opaque and anti-aliased edges blend as drawn;
+6. refuses to upscale: if the fitted width exceeds the art's width →
    `RESOLUTION_BLOCK`;
-5. records the placement (marker quad, art quad, ring statistics, scale,
-   rotation, method) so QA can recompute the composite from the base scene,
-   the source and the placement and compare pixel-for-pixel.
+7. records the placement (marker quad, art quad, ring statistics, removal
+   growth, texture, continuity, shading, scale, rotation, method,
+   compositor version) so QA can recompute the composite from the base
+   scene, the source and the placement and compare pixel-for-pixel.
 
 The generated base scene (with the marker) is kept beside each final
 composite for audit.
@@ -354,12 +383,18 @@ successful. Deterministic checks, computed: image size; art identity
 (the final equals a fresh recomposite of base scene + approved source +
 recorded placement, so spelling, internal geometry and content are preserved
 by construction and any post-edit is caught); marker removed before
-placement (zero chroma pixels in the reconstructed base within the isolated
-marker component; chroma elsewhere in the scene is scenery); no residual chroma
-leak (zero chroma pixels in the final where the marker was and the art does
-not cover); shading derived from the reconstruction, not the marker; no
-upscale; aspect preserved; placement within bounds; single placement, no
-duplicate or ghost art; product specification consistent. Per image: `PASS` or
+placement (zero chroma pixels in the reconstructed base within the
+fringe-aware removal mask; chroma elsewhere in the scene is scenery); no
+residual chroma leak (zero chroma pixels in the final where the marker was
+and the art does not cover); **no marker fringe** (visibly marker-tinted
+pixels, by the relative chroma gate at a 12-level margin, in the 0 to 4 px
+band outside the repaired region of the final may not exceed the clean 4 to
+9 px band's own rate plus 0.2% of the band, so a scene's natural chroma is
+never falsely rejected); **reconstruction continuity**; **garment texture
+restored**; **bounded shading** (median at most 1.0, minimum at or above
+the floor); shading derived from the low-frequency reconstruction, not the
+marker; no upscale; aspect preserved; placement within bounds; single
+placement, no duplicate or ghost art; product specification consistent. Per image: `PASS` or
 `BLOCKED` (→ `QA_FAILED`); an unusable scene is `REROLL`.
 
 Judgements that need eyes are never auto-passed: realistic shirt
@@ -372,6 +407,51 @@ composite and report what it sees; the human decides.
 
 Campaign-level checks: source identity consistent, garment consistent,
 artwork consistent, six required images present.
+
+## Recomposite and Supersession
+
+When the compositor is corrected after a campaign reached
+`READY_FOR_HUMAN_RENDER_REVIEW`, the six stored base scenes can be
+recomposited locally with no generation call and no spend. The command:
+
+```
+AUTHORIZE LISTING RECOMPOSITE <design_id>
+```
+
+Same structure rules as the render command; it is a different command and
+neither authorizes the other. Any other message proposes
+(`AWAITING_RECOMPOSITE_AUTHORIZATION`) and changes nothing. Run with
+`render.py recomposite --design-id <id> --message "<verbatim>"`; no
+provider is constructed.
+
+The run verifies the existing package (result, six finals hash-matched, six
+base scenes present), that its compositor version differs from the current
+one (`ALREADY_CURRENT` otherwise), and that the package's source copy equals
+both its manifest hash and the staged Skill #6 handoff (`SOURCE_MISMATCH`
+otherwise). It then composites every stored base scene with the current
+compositor and runs full deterministic QA in a temporary directory. Any
+scene the corrected compositor cannot use → `RECOMPOSITE_FAILED`, nothing
+moved; there is no reroll in a recomposite.
+
+Supersession is two renames, never an overwrite or a delete:
+
+```
+<campaign root>/_superseded/<design_id>-<original job>/      ← the whole original package, byte-identical
+<campaign root>/_superseded/<design_id>-<original job>.SUPERSEDED.json
+<campaign root>/<design_id>/                                  ← the recomposited package, job <original job>-rc<N>
+```
+
+The `SUPERSEDED.json` record names the original job, the superseding job,
+the time, the reason, the original result, the original manifest hash and
+the original final hashes. The new manifest carries a `recomposite` block:
+original job, reason, superseded package and record paths, superseded
+manifest hash, original final hashes, the SHA-256 of every base scene
+reused, the source hash, `generation_calls: 0`, `estimated_api_cost_usd:
+0.0`, the original job's cost and reroll count; and `rendering` records the
+compositor version and commit. `source/recomposite-reference.json` repeats
+the lineage; the cost log records zero images, zero calls, zero spend. If
+the second rename fails the original is put back. The new package is for
+human review like any other; `publication_authorized` stays `false`.
 
 ## Campaign Layout
 
@@ -549,8 +629,20 @@ for every job that ran. `human_action_required` is `null` for
 | `CAMPAIGN_CONFLICT` | no | none | An existing campaign differs or is incomplete |
 | `MANIFEST_FAILED` | partial | failed job | Records could not be written |
 | `VERIFICATION_FAILED` | partial | failed job | The package did not verify; nothing published |
+| `AWAITING_RECOMPOSITE_AUTHORIZATION` | no | none | Recomposite proposed; the exact command is not in this run |
+| `ALREADY_CURRENT` | no | none | The package was composited with the current compositor |
+| `CAMPAIGN_NOT_FOUND` | no | none | No package to recomposite |
+| `RECOMPOSITE_FAILED` | no | none | A stored scene cannot be composited by the current compositor; original untouched |
 
 ## Pitfalls
+
+- **A faint magenta outline around the print, or a flat dark rectangle
+  behind it.** Job `863b478926`, 2026-10-02: the pre-correction compositor
+  left the anti-aliased marker fringe in place and filled the print area
+  with a texture-free, under-converged field. Corrected by fringe-aware
+  removal, converged reconstruction, quilted texture and the fringe and
+  continuity QA checks; a reviewed package is repaired by
+  `AUTHORIZE LISTING RECOMPOSITE <design_id>`, never by regenerating.
 
 - **The marker was clearly solid but the fill ratio came out 0.3.** Before
   2026-10-02 this was the validator measuring purple scenery as marker. It
@@ -3108,7 +3200,7 @@ The reconstructed base still held marker pixels (simulated); deterministic QA re
   {
    "check": "scene_1",
    "status": "FAIL",
-   "detail": "deterministic QA: marker_removed_before_placement 169 marker pixels remain in the reconstructed base within the isolated chest-marker component; scene pixels outside the marker are not touched; no_residual_chroma_leak 169 chroma pixels remain where the marker was and the art does not cover"
+   "detail": "deterministic QA: marker_removed_before_placement 169 marker pixels remain in the reconstructed base within the fringe-aware removal mask (0 fringe pixels added to the component); scene pixels outside it are not touched; no_residual_chroma_leak 169 chroma pixels remain where the marker was and the art does not cover"
   },
   {
    "check": "failed_job",
@@ -3326,6 +3418,201 @@ The reconstructed base still held marker pixels (simulated); deterministic QA re
   }
  ],
  "human_action_required": "No generation call made and no campaign files created. 1901-093 is eligible: source 1901-093-B.png (Drive id 1WloiO2PNmvIZHQWBsYyYjqDCQOlae6Ve, sha256 5211ed2ff15b…) staged at /home/claude/agents/1901/shared/render-handoffs/1901-093/source/1901-093-B.png; product Comfort Colors 1717 Garment-Dyed Heavyweight T-Shirt / Printify / Monster Digital / Pepper; six scenes (2 high, 4 medium) at 1024x1024 on mock / mock-image-1 at an estimated $0.6000, month $3.1000 → $3.7000; output /home/claude/agents/1901/shared/render-campaigns/1901-093. To authorize exactly this render job, send exactly: AUTHORIZE LISTING RENDER 1901-093"
+}
+```
+
+### P. Recomposite proposal: AWAITING_RECOMPOSITE_AUTHORIZATION
+
+Input: `Recomposite the 1901-093 campaign with the corrected compositor.` A reviewed package rendered by an older compositor exists; nothing is changed.
+
+```json
+{
+ "design_id": "1901-093",
+ "result": "AWAITING_RECOMPOSITE_AUTHORIZATION",
+ "recomposite_performed": false,
+ "render_job_id": "origjob001-rc1",
+ "supersedes": {
+  "render_job_id": "origjob001",
+  "folder": "/home/claude/agents/1901/shared/render-campaigns/1901-093",
+  "manifest_sha256": "fcdba632ebc93362e88ed527f50b666f3147babf73091a74b470ba235b251059",
+  "original_result": "READY_FOR_HUMAN_RENDER_REVIEW",
+  "original_estimated_api_cost_usd": 0.6,
+  "original_final_sha256": {
+   "01-hero.png": "e4c5c67e97c12cebbb5f4486d15124a1d5f0250ee8a79fcd142f5c58bc238326",
+   "02-story.png": "c5f36a68b8548f1f37bfe9ef0f3ec0985c438697cb4cf39b5348baa4a6d935a5",
+   "03-travel.png": "94fb006aecb621fdc1004aafc1435a62bdf8359b52f4a781ad4b10be71baac98",
+   "04-flatlay.png": "d5d3ba266da9b324404de5cce5e41796291276d4401161a5ca7e0753669d7fac",
+   "05-folded.png": "62ea96100fd0c7c3e81e368a514736f930519d3c4617b315bead657603a6ad0f",
+   "06-detail.png": "45ba157afad34ab51100ff577a31f7ebd904f122f6d42aa4813b59557e7a1a61"
+  }
+ },
+ "generation_calls": 0,
+ "estimated_api_cost_usd": 0.0,
+ "compositor": {
+  "version": "2026-10-02.3",
+  "commit": "1ccf4a7c6766"
+ },
+ "timestamp": "2026-10-01T02:00:00Z",
+ "campaign": {
+  "root": "/home/claude/agents/1901/shared/render-campaigns/",
+  "design_folder": "/home/claude/agents/1901/shared/render-campaigns/1901-093",
+  "manifest_path": "/home/claude/agents/1901/shared/render-campaigns/1901-093/manifest.json",
+  "superseded_folder": "/home/claude/agents/1901/shared/render-campaigns/_superseded/1901-093-origjob001",
+  "superseded_record": "/home/claude/agents/1901/shared/render-campaigns/_superseded/1901-093-origjob001.SUPERSEDED.json"
+ },
+ "authorization": {
+  "received": false,
+  "evidence": ""
+ },
+ "warnings": [],
+ "checks": [
+  {
+   "check": "existing_campaign",
+   "status": "PASS",
+   "detail": "job origjob001: six finals hash-verified, six base scenes present, result READY_FOR_HUMAN_RENDER_REVIEW"
+  },
+  {
+   "check": "compositor_version",
+   "status": "PASS",
+   "detail": "package compositor 'old' → current 2026-10-02.3 (commit 1ccf4a7c6766)"
+  },
+  {
+   "check": "source",
+   "status": "PASS",
+   "detail": "exact approved source 1901-093-B.png (sha256 5211ed2ff15b…) equals the staged handoff; it will be reused byte-for-byte"
+  },
+  {
+   "check": "base_scenes",
+   "status": "PASS",
+   "detail": "six stored base scenes will be reused; no generation call: 01-hero-base.png 70c1fcb2, 02-story-base.png 62496122, 03-travel-base.png 81a6c072, 04-flatlay-base.png 73da421d, 05-folded-base.png 9960602a, 06-detail-base.png f3d8cf62"
+  },
+  {
+   "check": "authorization",
+   "status": "FAIL",
+   "detail": "the current run does not contain the exact command AUTHORIZE LISTING RECOMPOSITE 1901-093; nothing was changed"
+  }
+ ],
+ "human_action_required": "Nothing changed. Job origjob001 for 1901-093 would be recomposited locally with compositor 2026-10-02.3 from its six stored base scenes and the exact source (sha256 5211ed2ff15b…), with no generation call and no spend, as job origjob001-rc1; the current package would move whole to /home/claude/agents/1901/shared/render-campaigns/_superseded/1901-093-origjob001 with 1901-093-origjob001.SUPERSEDED.json beside it, and the new package would be published at /home/claude/agents/1901/shared/render-campaigns/1901-093 for human review. To authorize exactly this, send exactly: AUTHORIZE LISTING RECOMPOSITE 1901-093"
+}
+```
+
+### Q. Authorised recomposite: READY_FOR_HUMAN_RENDER_REVIEW
+
+Input: `AUTHORIZE LISTING RECOMPOSITE 1901-093`. The original package moved whole to `_superseded/`, the new package published in its place; zero generation calls, zero spend.
+
+```json
+{
+ "design_id": "1901-093",
+ "result": "READY_FOR_HUMAN_RENDER_REVIEW",
+ "recomposite_performed": true,
+ "render_job_id": "origjob001-rc1",
+ "supersedes": {
+  "render_job_id": "origjob001",
+  "folder": "/home/claude/agents/1901/shared/render-campaigns/1901-093",
+  "manifest_sha256": "fcdba632ebc93362e88ed527f50b666f3147babf73091a74b470ba235b251059",
+  "original_result": "READY_FOR_HUMAN_RENDER_REVIEW",
+  "original_estimated_api_cost_usd": 0.6,
+  "original_final_sha256": {
+   "01-hero.png": "e4c5c67e97c12cebbb5f4486d15124a1d5f0250ee8a79fcd142f5c58bc238326",
+   "02-story.png": "c5f36a68b8548f1f37bfe9ef0f3ec0985c438697cb4cf39b5348baa4a6d935a5",
+   "03-travel.png": "94fb006aecb621fdc1004aafc1435a62bdf8359b52f4a781ad4b10be71baac98",
+   "04-flatlay.png": "d5d3ba266da9b324404de5cce5e41796291276d4401161a5ca7e0753669d7fac",
+   "05-folded.png": "62ea96100fd0c7c3e81e368a514736f930519d3c4617b315bead657603a6ad0f",
+   "06-detail.png": "45ba157afad34ab51100ff577a31f7ebd904f122f6d42aa4813b59557e7a1a61"
+  }
+ },
+ "generation_calls": 0,
+ "estimated_api_cost_usd": 0.0,
+ "compositor": {
+  "version": "2026-10-02.3",
+  "commit": "1ccf4a7c6766"
+ },
+ "timestamp": "2026-10-01T02:00:00Z",
+ "campaign": {
+  "root": "/home/claude/agents/1901/shared/render-campaigns/",
+  "design_folder": "/home/claude/agents/1901/shared/render-campaigns/1901-093",
+  "manifest_path": "/home/claude/agents/1901/shared/render-campaigns/1901-093/manifest.json",
+  "superseded_folder": "/home/claude/agents/1901/shared/render-campaigns/_superseded/1901-093-origjob001",
+  "superseded_record": "/home/claude/agents/1901/shared/render-campaigns/_superseded/1901-093-origjob001.SUPERSEDED.json"
+ },
+ "authorization": {
+  "received": true,
+  "evidence": "AUTHORIZE LISTING RECOMPOSITE 1901-093"
+ },
+ "warnings": [],
+ "checks": [
+  {
+   "check": "existing_campaign",
+   "status": "PASS",
+   "detail": "job origjob001: six finals hash-verified, six base scenes present, result READY_FOR_HUMAN_RENDER_REVIEW"
+  },
+  {
+   "check": "compositor_version",
+   "status": "PASS",
+   "detail": "package compositor 'old' → current 2026-10-02.3 (commit 1ccf4a7c6766)"
+  },
+  {
+   "check": "source",
+   "status": "PASS",
+   "detail": "exact approved source 1901-093-B.png (sha256 5211ed2ff15b…) equals the staged handoff; it will be reused byte-for-byte"
+  },
+  {
+   "check": "base_scenes",
+   "status": "PASS",
+   "detail": "six stored base scenes will be reused; no generation call: 01-hero-base.png 70c1fcb2, 02-story-base.png 62496122, 03-travel-base.png 81a6c072, 04-flatlay-base.png 73da421d, 05-folded-base.png 9960602a, 06-detail-base.png f3d8cf62"
+  },
+  {
+   "check": "authorization",
+   "status": "PASS",
+   "detail": "current run contains the exact command: AUTHORIZE LISTING RECOMPOSITE 1901-093"
+  },
+  {
+   "check": "scene_1",
+   "status": "PASS",
+   "detail": "hero_lifestyle recomposited from the stored base scene at scale 0.2079, deterministic QA PASS"
+  },
+  {
+   "check": "scene_2",
+   "status": "PASS",
+   "detail": "secondary_lifestyle_story recomposited from the stored base scene at scale 0.2364, deterministic QA PASS"
+  },
+  {
+   "check": "scene_3",
+   "status": "PASS",
+   "detail": "travel_packing recomposited from the stored base scene at scale 0.1493, deterministic QA PASS"
+  },
+  {
+   "check": "scene_4",
+   "status": "PASS",
+   "detail": "editorial_flat_lay recomposited from the stored base scene at scale 0.2521, deterministic QA PASS"
+  },
+  {
+   "check": "scene_5",
+   "status": "PASS",
+   "detail": "folded_garment_detail recomposited from the stored base scene at scale 0.1779, deterministic QA PASS"
+  },
+  {
+   "check": "scene_6",
+   "status": "PASS",
+   "detail": "product_construction_detail recomposited from the stored base scene at scale 0.1493, deterministic QA PASS"
+  },
+  {
+   "check": "manifest",
+   "status": "PASS",
+   "detail": "qa.json, contact-sheet.png, cost-log.json (zero generation, zero spend) and manifest.json with the recomposite block written"
+  },
+  {
+   "check": "supersession",
+   "status": "PASS",
+   "detail": "job origjob001 moved whole to /home/claude/agents/1901/shared/render-campaigns/_superseded/1901-093-origjob001 (manifest sha256 unchanged) with 1901-093-origjob001.SUPERSEDED.json beside it; job origjob001-rc1 published at /home/claude/agents/1901/shared/render-campaigns/1901-093"
+  },
+  {
+   "check": "package_verification",
+   "status": "PASS",
+   "detail": "20 files present, six finals hash-verified, six base scenes byte-identical to the superseded package, publication_authorized=false, generation_calls=0"
+  }
+ ],
+ "human_action_required": null
 }
 ```
 

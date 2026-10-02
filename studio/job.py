@@ -20,6 +20,176 @@ APPROVAL = {"STATUS_NOT_APPROVED", "MISSING_HUMAN_APPROVAL", "HUMAN_REVISE", "HU
 SOURCEISH = {"AMBIGUOUS_SOURCE", "SOURCE_NOT_MASTER", "SOURCE_UNVERIFIED"}
 
 
+RECOMPOSITE_WORDS = ("AUTHORIZE", "LISTING", "RECOMPOSITE")
+
+
+def compositor_commit():
+    """Commit of this skill's local clone, read from .git without running git (pure file reads). None if unknown."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        head = open(os.path.join(root, ".git", "HEAD"), encoding="utf-8").read().strip()
+        if not head.startswith("ref: "): return head[:12]
+        ref = head[5:]; path = os.path.join(root, ".git", ref)
+        if os.path.isfile(path): return open(path, encoding="utf-8").read().strip()[:12]
+        for line in open(os.path.join(root, ".git", "packed-refs"), encoding="utf-8"):
+            parts = line.split()
+            if len(parts) == 2 and parts[1] == ref: return parts[0][:12]
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def recomposite_command(message, design_id):
+    if not isinstance(message, str): return None
+    parts = message.strip().split()
+    if len(parts) != 4 or tuple(w.upper() for w in parts[:3]) != RECOMPOSITE_WORDS: return None
+    return ("OK", message.strip()) if parts[3] == design_id else ("OTHER_ID", parts[3])
+
+
+def recomposite(design_id, message, handoff_root=config.HANDOFF_ROOT, campaign_root=config.CAMPAIGN_ROOT, now=None, new_job_id=None):
+    """Local recomposite of an existing reviewed campaign with the current compositor: the six stored base scenes and the
+    exact source are reused, NO provider is constructed, no generation call is possible, no spend. The existing package
+    is never overwritten or deleted: it is moved whole to _superseded/<design_id>-<render_job_id>/ beside a
+    SUPERSEDED.json record, and the new package takes its place at <campaign root>/<design_id>/ in one rename each.
+    Proposal-before-authorization: only the exact command AUTHORIZE LISTING RECOMPOSITE <design_id> performs it."""
+    now = now or now_iso()
+    did = design_id.strip() if isinstance(design_id, str) else ""
+    out = {"design_id": did, "result": "", "recomposite_performed": False, "render_job_id": "", "supersedes": None, "generation_calls": 0, "estimated_api_cost_usd": 0.0,
+           "compositor": {"version": compositor.COMPOSITOR_VERSION, "commit": compositor_commit()}, "timestamp": now,
+           "campaign": {"root": campaign_root, "design_folder": "", "manifest_path": "", "superseded_folder": "", "superseded_record": ""},
+           "authorization": {"received": False, "evidence": ""}, "warnings": [], "checks": [], "human_action_required": None}
+    checks, warnings = out["checks"], out["warnings"]
+    def chk(name, status, detail): checks.append({"check": name, "status": status, "detail": detail})
+    def done(result, action=None): out["result"] = result; out["human_action_required"] = action; return out
+    auth = recomposite_command(message, did)
+    if not did or any(ch.isspace() for ch in did):
+        chk("input", "FAIL", "no single usable design_id"); return done("NOT_FOUND", "Supply exactly one design_id, then re-run.")
+    folder = os.path.join(campaign_root, did); mpath = os.path.join(folder, "manifest.json")
+    if not os.path.isfile(mpath):
+        chk("existing_campaign", "FAIL", f"no reviewed campaign package at {folder}"); return done("CAMPAIGN_NOT_FOUND", f"There is no campaign package for {did} to recomposite; render one first.")
+    try:
+        m = json.load(open(mpath, encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001
+        chk("existing_campaign", "FAIL", f"manifest unreadable ({e.__class__.__name__})"); return done("CAMPAIGN_CONFLICT", f"The campaign manifest for {did} is unreadable; a human must review {folder}.")
+    orig = m.get("render_job_id", ""); m_sha = sha256_bytes(open(mpath, "rb").read())
+    bad = [n for n, h in (m.get("final_sha256") or {}).items() if not os.path.isfile(os.path.join(folder, "final-composites", n)) or sha256_bytes(open(os.path.join(folder, "final-composites", n), "rb").read()) != h]
+    scenes = m.get("generated_scenes") or []
+    missing = [n for n in scenes if not os.path.isfile(os.path.join(folder, "generated-scenes", n))]
+    if m.get("result") != "READY_FOR_HUMAN_RENDER_REVIEW" or len(scenes) != 6 or bad or missing or m.get("design_id") != did:
+        chk("existing_campaign", "FAIL", f"package does not verify: result {m.get('result')!r}, scenes {len(scenes)}, missing {missing}, hash mismatches {bad}")
+        return done("CAMPAIGN_CONFLICT", f"The campaign package for {did} does not verify; a human must review {folder}. Nothing was changed.")
+    chk("existing_campaign", "PASS", f"job {orig}: six finals hash-verified, six base scenes present, result READY_FOR_HUMAN_RENDER_REVIEW")
+    if (m.get("rendering") or {}).get("compositor_version") == compositor.COMPOSITOR_VERSION:
+        chk("compositor_version", "FAIL", f"the package was already composited with compositor {compositor.COMPOSITOR_VERSION}")
+        return done("ALREADY_CURRENT", f"The campaign for {did} is already composited with the current compositor; nothing to redo.")
+    chk("compositor_version", "PASS", f"package compositor {(m.get('rendering') or {}).get('compositor_version', 'unversioned')!r} → current {compositor.COMPOSITOR_VERSION} (commit {out['compositor']['commit']})")
+    # source: the package copy must equal the manifest's hash and the staged handoff's
+    src_name = m["source"]["filename"]; art_path = os.path.join(folder, "source", src_name)
+    try:
+        src_bytes = open(art_path, "rb").read()
+    except OSError:
+        chk("source", "FAIL", "package source file missing"); return done("CAMPAIGN_CONFLICT", f"The source copy in the campaign package for {did} is missing; a human must review {folder}.")
+    staged = os.path.join(handoff_root, did, "manifest.json")
+    try:
+        staged_sha = json.load(open(staged, encoding="utf-8"))["source"]["sha256"]
+    except Exception:  # noqa: BLE001
+        staged_sha = None
+    if sha256_bytes(src_bytes) != m["source"]["sha256"] or staged_sha != m["source"]["sha256"]:
+        chk("source", "FAIL", f"package source sha {sha256_bytes(src_bytes)[:12]}…, manifest {m['source']['sha256'][:12]}…, staged handoff {str(staged_sha)[:12]}…")
+        return done("SOURCE_MISMATCH", f"The approved source for {did} no longer matches the campaign's source; a human must review before any recomposite.")
+    chk("source", "PASS", f"exact approved source {src_name} (sha256 {m['source']['sha256'][:12]}…) equals the staged handoff; it will be reused byte-for-byte")
+    product = m["product"]; garment_rgb = product["garment_rgb"]
+    sup_root = os.path.join(campaign_root, "_superseded"); sup_folder = os.path.join(sup_root, f"{did}-{orig}"); sup_record = sup_folder + ".SUPERSEDED.json"
+    if os.path.exists(sup_folder) or os.path.exists(sup_record):
+        chk("supersession", "FAIL", f"{sup_folder} already exists"); return done("CAMPAIGN_CONFLICT", f"A superseded package for job {orig} already exists; a human must review {sup_root}.")
+    n = 1 + sum(1 for d in (os.listdir(sup_root) if os.path.isdir(sup_root) else []) if d.startswith(f"{did}-{orig}-rc"))
+    job_id = new_job_id or f"{orig}-rc{n}"
+    out["render_job_id"] = job_id; out["campaign"].update(design_folder=folder, manifest_path=mpath, superseded_folder=sup_folder, superseded_record=sup_record)
+    out["supersedes"] = {"render_job_id": orig, "folder": folder, "manifest_sha256": m_sha, "original_result": m.get("result"), "original_estimated_api_cost_usd": m.get("estimated_api_cost_usd"), "original_final_sha256": m.get("final_sha256")}
+    scene_shas = {n_: sha256_bytes(open(os.path.join(folder, "generated-scenes", n_), "rb").read()) for n_ in scenes}
+    chk("base_scenes", "PASS", "six stored base scenes will be reused; no generation call: " + ", ".join(f"{k} {v[:8]}" for k, v in scene_shas.items()))
+    if not (auth and auth[0] == "OK"):
+        if auth: chk("authorization", "FAIL", f"the command names {auth[1]}, not the target {did}; it authorizes nothing in this run")
+        else: chk("authorization", "FAIL", f"the current run does not contain the exact command AUTHORIZE LISTING RECOMPOSITE {did}; nothing was changed")
+        return done("AWAITING_RECOMPOSITE_AUTHORIZATION", f"Nothing changed. Job {orig} for {did} would be recomposited locally with compositor {compositor.COMPOSITOR_VERSION} from its six stored base scenes and the exact source (sha256 {m['source']['sha256'][:12]}…), with no generation call and no spend, as job {job_id}; the current package would move whole to {sup_folder} with {os.path.basename(sup_record)} beside it, and the new package would be published at {folder} for human review. To authorize exactly this, send exactly: AUTHORIZE LISTING RECOMPOSITE {did}")
+    out["authorization"].update(received=True, evidence=auth[1]); chk("authorization", "PASS", f"current run contains the exact command: {auth[1]}")
+    tmp = os.path.join(campaign_root, f".tmp-{did}-{job_id}")
+    for sub in ("source", "generated-scenes", "final-composites", "qa"): os.makedirs(os.path.join(tmp, sub), exist_ok=False)
+    def fail(code, action):
+        shutil.rmtree(tmp, ignore_errors=True); chk("recomposite", "INFO", "temporary directory removed; the existing package was not touched"); return done(code, action)
+    try:
+        for f in os.listdir(os.path.join(folder, "source")): shutil.copyfile(os.path.join(folder, "source", f), os.path.join(tmp, "source", f))
+        for f in os.listdir(os.path.join(folder, "generated-scenes")): shutil.copyfile(os.path.join(folder, "generated-scenes", f), os.path.join(tmp, "generated-scenes", f))
+        new_art = os.path.join(tmp, "source", src_name)
+        if sha256_bytes(open(new_art, "rb").read()) != m["source"]["sha256"]: raise ValueError("source copy hash changed")
+        json.dump({"design_id": did, "recomposite_of_render_job_id": orig, "source_sha256": m["source"]["sha256"], "base_scenes_reused": scene_shas, "compositor_version": compositor.COMPOSITOR_VERSION, "compositor_commit": out["compositor"]["commit"], "lineage": "exact byte copies of the superseded package's source and generated scenes; nothing regenerated"}, open(os.path.join(tmp, "source", "recomposite-reference.json"), "w", encoding="utf-8"), indent=2)
+    except Exception as e:  # noqa: BLE001
+        chk("source_copy", "FAIL", f"{e.__class__.__name__}: {e}"); return fail("VERIFICATION_FAILED", f"The package could not be copied for {did}; nothing was changed.")
+    images = []; size = tuple(int(x) for x in (m.get("rendering") or {}).get("size", "1024x1024").split("x"))
+    for slot_rec in m["scene_slots"]:
+        slot, role, key = slot_rec["slot"], slot_rec["role"], config.SLOTS[slot_rec["slot"] - 1][1]
+        base_name = f"{slot:02d}-{key}-base.png"; final_name = f"{slot:02d}-{key}.png"; base_path = os.path.join(tmp, "generated-scenes", base_name)
+        try:
+            final_img, placement = compositor.composite(open(base_path, "rb").read(), new_art, garment_rgb)
+        except compositor.CompositeError as ce:
+            chk(f"scene_{slot}", "FAIL", f"{ce.code}: {ce.detail}; no reroll is possible in a recomposite"); return fail("RECOMPOSITE_FAILED", f"Scene {slot} of job {orig} cannot be composited by compositor {compositor.COMPOSITOR_VERSION} ({ce.detail}). The existing package is unchanged; a new render would need its own authorization.")
+        except Exception as e:  # noqa: BLE001
+            chk(f"scene_{slot}", "FAIL", f"compositing error ({e.__class__.__name__}: {e})"); return fail("RECOMPOSITE_FAILED", f"Deterministic compositing failed on scene {slot} for {did}; the existing package is unchanged.")
+        final_path = os.path.join(tmp, "final-composites", final_name); final_img.save(final_path, format="PNG")
+        result, qchecks, notes = qa.check_image(slot, role, base_path, final_path, new_art, placement, product, size)
+        rec = {"slot": slot, "role": role, "quality": slot_rec["quality"], "model": slot_rec["model"], "base_scene": f"generated-scenes/{base_name}", "final_composite": f"final-composites/{final_name}", "final_sha256": sha256_bytes(open(final_path, "rb").read()), "placement": placement, "qa_result": result, "checks": qchecks, "notes": notes, "source_sha256": m["source"]["sha256"], "product": {k: product[k] for k in ("blank", "provider", "color")}, "rerolls_used_here": slot_rec.get("rerolls_used_here", 0), "prompt": slot_rec.get("prompt", "")}
+        images.append(rec)
+        if result != "PASS":
+            chk(f"scene_{slot}", "FAIL", "deterministic QA: " + "; ".join(f"{k} {v['detail']}" for k, v in qchecks.items() if v["result"] == "FAIL")); return fail("QA_FAILED", f"Scene {slot} for {did} failed deterministic QA under compositor {compositor.COMPOSITOR_VERSION}; the existing package is unchanged.")
+        chk(f"scene_{slot}", "PASS", f"{role} recomposited from the stored base scene at scale {placement['scale']}, deterministic QA PASS")
+    try:
+        contact_sheet.build([(os.path.join(tmp, i["final_composite"]), f"{i['slot']:02d} {i['role']} ({i['quality']})") for i in images], os.path.join(tmp, "qa", "contact-sheet.png"))
+        cchecks = qa.campaign_checks(images, m["source"]["sha256"], {k: product[k] for k in ("blank", "provider", "color")})
+        qa_doc = {"design_id": did, "render_job_id": job_id, "recomposite_of_render_job_id": orig, "campaign_result": "PASS" if all(cchecks.values()) else "FAIL", "images": [{k: i[k] for k in ("slot", "role", "base_scene", "final_composite", "qa_result", "checks", "notes")} for i in images], "campaign_checks": cchecks, "human_review": {"required": True, "items": list(qa.HUMAN_CHECKS)}}
+        json.dump(qa_doc, open(os.path.join(tmp, "qa", "qa.json"), "w", encoding="utf-8"), indent=2)
+        if qa_doc["campaign_result"] != "PASS": chk("campaign_qa", "FAIL", json.dumps(cchecks)); return fail("QA_FAILED", f"Campaign-level QA failed for {did}; the existing package is unchanged.")
+        cost = {"render_job_id": job_id, "design_id": did, "recomposite_of_render_job_id": orig, "started_at": now, "completed_at": now, "model": (m.get("rendering") or {}).get("model"), "size": (m.get("rendering") or {}).get("size"), "quality_mix": config.QUALITY_MIX, "images_generated": 0, "generation_calls": 0, "rerolls": 0, "source_drive_id": m["source"].get("drive_file_id"), "source_sha256": m["source"]["sha256"], "usage_record": [], "estimated_api_cost_usd": 0.0, "campaign_folder": folder, "job_status": "COMPLETED", "budget_flag": "OK", "notes": [f"local recomposite of job {orig} with compositor {compositor.COMPOSITOR_VERSION} (commit {out['compositor']['commit']}); no generation call; no spend; that job's own cost log is preserved under _superseded"], "actual_billed_cost_usd": None}
+        json.dump(cost, open(os.path.join(tmp, "cost-log.json"), "w", encoding="utf-8"), indent=2)
+        manifest = {**{k: v for k, v in m.items() if k not in ("scene_slots", "final_composites", "final_sha256", "qa_status", "estimated_api_cost_usd", "reroll_count", "created_at", "render_job_id", "rendering")},
+                    "render_job_id": job_id, "created_at": now, "result": "READY_FOR_HUMAN_RENDER_REVIEW",
+                    "rendering": {**(m.get("rendering") or {}), "compositor": "marker-geometry + fringe-aware removal + converged harmonic reconstruction + ring-texture quilting + pillow-perspective + bounded-luminance-multiply", "compositor_version": compositor.COMPOSITOR_VERSION, "compositor_commit": out["compositor"]["commit"], "artwork_transformations": "geometric and bounded lighting only"},
+                    "recomposite": {"of_render_job_id": orig, "reason": "compositor revision; the first package reached READY_FOR_HUMAN_RENDER_REVIEW but required compositor correction", "superseded_package": os.path.relpath(sup_folder, campaign_root), "superseded_record": os.path.relpath(sup_record, campaign_root), "superseded_manifest_sha256": m_sha, "original_final_sha256": m.get("final_sha256"), "base_scenes_reused": scene_shas, "source_sha256": m["source"]["sha256"], "generation_calls": 0, "estimated_api_cost_usd": 0.0, "original_estimated_api_cost_usd": m.get("estimated_api_cost_usd"), "original_reroll_count": m.get("reroll_count")},
+                    "scene_slots": [{"slot": i["slot"], "role": i["role"], "quality": i["quality"], "model": i["model"], "prompt": i["prompt"], "placement": i["placement"], "rerolls_used_here": i["rerolls_used_here"]} for i in images],
+                    "generated_scenes": scenes, "final_composites": [i["final_composite"].split("/", 1)[1] for i in images], "final_sha256": {i["final_composite"].split("/", 1)[1]: i["final_sha256"] for i in images},
+                    "qa_status": qa_doc["campaign_result"], "qa_path": "qa/qa.json", "contact_sheet": "qa/contact-sheet.png", "estimated_api_cost_usd": 0.0, "reroll_count": 0, "cost_log": "cost-log.json", "publication_authorized": False, "human_review_required": True}
+        json.dump(manifest, open(os.path.join(tmp, "manifest.json"), "w", encoding="utf-8"), indent=2)
+    except Exception as e:  # noqa: BLE001
+        chk("manifest", "FAIL", f"{e.__class__.__name__}: {e}"); return fail("MANIFEST_FAILED", f"The recomposite records for {did} could not be written; the existing package is unchanged.")
+    chk("manifest", "PASS", "qa.json, contact-sheet.png, cost-log.json (zero generation, zero spend) and manifest.json with the recomposite block written")
+    m2 = json.load(open(os.path.join(tmp, "manifest.json"), encoding="utf-8"))
+    expected = [os.path.join("source", src_name), "source/manifest.json", "source/source-reference.json", "source/recomposite-reference.json", "qa/qa.json", "qa/contact-sheet.png", "cost-log.json", "manifest.json"] + [f"generated-scenes/{n_}" for n_ in scenes] + [f"final-composites/{n_}" for n_ in m2["final_composites"]]
+    missing = [f for f in expected if not os.path.isfile(os.path.join(tmp, f))]
+    bad_hash = [n_ for n_, h in m2["final_sha256"].items() if sha256_bytes(open(os.path.join(tmp, "final-composites", n_), "rb").read()) != h]
+    if missing or bad_hash or len(m2["final_composites"]) != 6 or m2["publication_authorized"] is not False or sha256_bytes(open(new_art, "rb").read()) != m["source"]["sha256"] or any(sha256_bytes(open(os.path.join(tmp, "generated-scenes", n_), "rb").read()) != h for n_, h in scene_shas.items()):
+        chk("package_verification", "FAIL", f"missing {missing}, hash mismatches {bad_hash}"); return fail("VERIFICATION_FAILED", f"The recomposited package for {did} did not verify; the existing package is unchanged.")
+    # publish: supersede the existing package whole (one rename), record it, then put the new package in place (one rename)
+    os.makedirs(sup_root, exist_ok=True)
+    if sha256_bytes(open(mpath, "rb").read()) != m_sha:
+        chk("supersession", "FAIL", "the existing manifest changed during the recomposite"); return fail("CAMPAIGN_CONFLICT", f"The campaign for {did} changed while the recomposite ran; a human must review.")
+    os.rename(folder, sup_folder)
+    try:
+        json.dump({"design_id": did, "render_job_id": orig, "superseded_by": job_id, "superseded_at": now, "reason": "compositor revision; the first composite package reached READY_FOR_HUMAN_RENDER_REVIEW but required compositor correction", "original_result": m.get("result"), "original_manifest_sha256": m_sha, "original_final_sha256": m.get("final_sha256"), "original_estimated_api_cost_usd": m.get("estimated_api_cost_usd"), "folder": os.path.relpath(sup_folder, campaign_root), "preserved": "whole package moved by rename; no file inside it was modified"}, open(sup_record, "w", encoding="utf-8"), indent=2)
+        os.rename(tmp, folder)
+    except Exception as e:  # noqa: BLE001
+        try:
+            if os.path.isfile(sup_record): os.remove(sup_record)
+            if not os.path.exists(folder): os.rename(sup_folder, folder)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        chk("supersession", "FAIL", f"publish failed ({e.__class__.__name__}: {e}); the original package was restored"); return done("VERIFICATION_FAILED", f"The recomposited package for {did} could not be published; the original package is back in place.")
+    if sha256_bytes(open(os.path.join(sup_folder, "manifest.json"), "rb").read()) != m_sha:
+        chk("supersession", "FAIL", "superseded manifest hash changed"); return done("VERIFICATION_FAILED", f"The superseded package for {did} did not verify after the move; a human must review {sup_root}.")
+    out["recomposite_performed"] = True
+    chk("supersession", "PASS", f"job {orig} moved whole to {sup_folder} (manifest sha256 unchanged) with {os.path.basename(sup_record)} beside it; job {job_id} published at {folder}")
+    chk("package_verification", "PASS", f"{len(expected)} files present, six finals hash-verified, six base scenes byte-identical to the superseded package, publication_authorized=false, generation_calls=0")
+    return done("READY_FOR_HUMAN_RENDER_REVIEW", None)
+
+
 def now_iso():
     return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -411,7 +581,7 @@ def run(design_id, evidence, message, provider, handoff_root=config.HANDOFF_ROOT
         manifest = {"schema_version": config.SCHEMA_VERSION, "design_id": did, "render_job_id": job_id, "created_at": now, "result": "READY_FOR_HUMAN_RENDER_REVIEW",
                     "source": {"drive_file_id": info["drive_file_id"], "drive_url": info["drive_url"], "filename": info["filename"], "sha256": info["sha256"], "staged_handoff_path": info["folder"], "staged_source_path": info["staged_path"], "campaign_copy": f"source/{info['filename']}", "lineage": "1901-stage-render-source handoff → exact byte copy → deterministic perspective composite"},
                     "product": {**{k: product[k] for k in ("blank", "provider", "color", "spec_source")}, "garment_rgb": list(product["garment_rgb"])},
-                    "rendering": {"mode": "composited_fidelity", "provider": provider.name, "model": provider.model, "size": size, "quality_mix": config.QUALITY_MIX, "pricing_snapshot": snap, "compositor": "marker-geometry + harmonic garment reconstruction + pillow-perspective + luminance-multiply", "artwork_transformations": "geometric and lighting only"},
+                    "rendering": {"mode": "composited_fidelity", "provider": provider.name, "model": provider.model, "size": size, "quality_mix": config.QUALITY_MIX, "pricing_snapshot": snap, "compositor": "marker-geometry + fringe-aware removal + converged harmonic reconstruction + ring-texture quilting + pillow-perspective + bounded-luminance-multiply", "compositor_version": compositor.COMPOSITOR_VERSION, "compositor_commit": compositor_commit(), "artwork_transformations": "geometric and bounded lighting only"},
                     "scene_slots": [{"slot": i["slot"], "role": i["role"], "quality": i["quality"], "model": i["model"], "prompt": scene_prompts[f"{i['slot']:02d}-{config.SLOTS[i['slot'] - 1][1]}"], "placement": i["placement"], "rerolls_used_here": i["rerolls_used_here"]} for i in images],
                     "generated_scenes": [i["base_scene"].split("/", 1)[1] for i in images], "final_composites": [i["final_composite"].split("/", 1)[1] for i in images], "final_sha256": {i["final_composite"].split("/", 1)[1]: i["final_sha256"] for i in images},
                     "qa_status": qa_doc["campaign_result"], "qa_path": "qa/qa.json", "contact_sheet": "qa/contact-sheet.png", "estimated_api_cost_usd": guard.job_cost, "reroll_count": guard.rerolls, "cost_log": "cost-log.json",
