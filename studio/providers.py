@@ -62,7 +62,7 @@ class Provider:
 
 class MockProvider(Provider):
     """Draws a synthetic garment scene with real shading and a UNIFORM chroma marker (the marker carries
-    no shading information). `script` lists per-call behaviours: "ok", "no_marker", "tiny", "edge"
+    no shading information). `script` lists per-call behaviours: "ok", "no_marker", "tiny", "edge", "purple_bg", "hollow", "fragmented"
     (marker straddling the shirt edge: ring inconsistent), "error". Beyond the script: "ok".
     marker_pattern "uniform" | "noisy" controls the marker's own pixel values (for the test proving
     shading does not depend on them)."""
@@ -113,6 +113,19 @@ def draw_scene(size, color, slot, behaviour="ok", marker_pattern="uniform"):
                 d.line([(x0, y), (x1 - 1, y)], fill=(v, (y * 3) % 60, 255 - (y % 80)))
     elif behaviour == "tiny":
         d.rectangle([w * 0.49, h * 0.49, w * 0.52, h * 0.52], fill=config.PLACEHOLDER_RGB)
+    elif behaviour == "purple_bg":                                         # good marker + unrelated magenta/purple scenery outside the shirt
+        x0, y0, x1, y1 = int(q[0] * w), int(q[1] * h), int(q[2] * w), int(q[3] * h)
+        d.rectangle([x0, y0, x1 - 1, y1 - 1], fill=config.PLACEHOLDER_RGB)
+        for i, (bx, by, bw, bh) in enumerate(((0.02, 0.03, 0.08, 0.10), (0.88, 0.05, 0.10, 0.08), (0.90, 0.80, 0.07, 0.15), (0.03, 0.70, 0.10, 0.06), (0.80, 0.02, 0.05, 0.05))):
+            d.rectangle([bx * w, by * h, (bx + bw) * w - 1, (by + bh) * h - 1], fill=(180 + 10 * i, 60 - 5 * i, 200 + 8 * i))   # passes the marker-colour mask
+        for i in range(60):                                                 # scattered single purple pixels in the sky
+            img.putpixel((int(w * 0.05 + (i * 37) % int(w * 0.9)), int(h * 0.02 + (i * 13) % int(h * 0.15))), (170, 40, 230))
+    elif behaviour == "hollow":                                            # a magenta frame: not a solid panel
+        x0, y0, x1, y1 = int(q[0] * w), int(q[1] * h), int(q[2] * w), int(q[3] * h)
+        d.rectangle([x0, y0, x1 - 1, y1 - 1], fill=config.PLACEHOLDER_RGB); d.rectangle([x0 + 40, y0 + 40, x1 - 41, y1 - 41], fill=tuple(color))
+    elif behaviour == "fragmented":                                        # two comparable magenta blocks with a gap: no single dominant marker
+        x0, y0, x1, y1 = int(q[0] * w), int(q[1] * h), int(q[2] * w), int(q[3] * h); xm = (x0 + x1) // 2
+        d.rectangle([x0, y0, xm - 12, y1 - 1], fill=config.PLACEHOLDER_RGB); d.rectangle([xm + 12, y0, x1 - 1, y1 - 1], fill=config.PLACEHOLDER_RGB)
     return img
 
 

@@ -20,7 +20,8 @@ def check_image(slot, role, base_png_path, final_png_path, art_path, placement, 
     identity = c("art_identity_recomposite_match", diff is None, "final equals a fresh deterministic composite of base scene + approved source + recorded placement; spelling and internal geometry preserved by construction" if diff is None else f"final differs from the recomputed composite in region {diff}: the artwork or image was altered after compositing")
     # marker handling
     base, _, mask = compositor.prepare_base(scene, placement)
-    c("marker_removed_before_placement", compositor.marker_pixels(base) == 0, f"{compositor.marker_pixels(base)} marker pixels remain in the reconstructed base")
+    remaining = compositor.marker_pixels(Image.composite(base, Image.new("RGB", base.size, (0, 0, 0)), mask.convert("L")))
+    c("marker_removed_before_placement", remaining == 0, f"{remaining} marker pixels remain in the reconstructed base within the isolated chest-marker component; scene pixels outside the marker are not touched")
     alpha = compositor.warped_alpha(scene.size, art, placement)
     exposed = ImageChops.subtract(mask.convert("L"), alpha.point(lambda v: 255 if v > 0 else 0))       # marker area not covered by art
     leak = compositor.marker_pixels(Image.composite(final, Image.new("RGB", final.size, (0, 0, 0)), exposed))

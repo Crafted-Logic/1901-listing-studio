@@ -245,12 +245,42 @@ commit the row later.
 ## Rerolls
 
 A reroll is any generation call beyond the first six, caused by unusable
-output. At most 4 per campaign. Each is recorded with its slot, reason,
+output. At most 4 per render job. Each is recorded with its slot, reason,
 prior failure and added cost. The renderer rejects a scene whose print area
 cannot be found or is implausible and makes one controlled replacement; it
 never distorts the art to rescue a scene. At 4 rerolls it stops
 (`QA_FAILED` for the slot that still has no usable scene); more needs a new
-human authorization under a future override path.
+human authorization.
+
+**Prior failed jobs.** Before proposing or running, the skill lists this
+design's failed jobs under `_failed/` (read-only) in `prior_failed_jobs`
+and a `prior_failed_jobs` check: result, rerolls, spend and attribution.
+Their spend already counts in the monthly floor; their rerolls never carry
+into a new job, whose allowance is always the normal 4.
+
+**Validator-defect retry.** A job whose rerolls were consumed by a confirmed
+defect in this skill's own validation (job `4c8fda750c`, 2026-10-02: Scene 1
+marker validation measured every magenta-coloured pixel in the image, so
+purple scenery inflated the inferred polygon) is not a record of four bad
+generations. A human may record that ruling beside the failed folder, never
+inside it, as `_failed/<design_id>-<render_job_id>.validator-defect.json`:
+
+```json
+{ "design_id": "1901-093", "render_job_id": "4c8fda750c",
+  "defect": "<what the validator got wrong>", "corrected_in": "<commit that fixed it>",
+  "ruled_by": "<human>", "ruled_at": "<date>", "scope": "validator-defect" }
+```
+
+The skill then reports that job's attribution as `validator-defect` and
+writes the attribution into the new job's cost log and expense-row notes.
+That is the whole effect. The record is not a bypass: it must name that
+exact job, the defect and the correcting commit, and who ruled; a record
+that is incomplete, unreadable, or names another job is ignored with a
+warning and the failure stays an ordinary one. The failed job stays in
+`_failed/` untouched. The retry is a new job that needs its own exact
+`AUTHORIZE LISTING RENDER <design_id>`, starts at 0 rerolls, is capped at
+4 like any job, and pays for every call. Ordinary bad generations always
+count against the cap; Walter never writes a validator-defect record.
 
 ## Scene Generation and Compositing
 
@@ -267,8 +297,18 @@ Two separate concerns, deliberately kept apart:
 
 - **A. Print-area geometry.** The magenta rectangle is a chroma marker used
   only to locate the print-area quadrilateral. Its own pixel values are never
-  read for anything else. No marker, too small, too large, not a solid
-  convex panel, or touching the image edge → the scene is unusable (reroll).
+  read for anything else. The marker-colour mask is split into 4-connected
+  components and the chest marker is isolated before any geometry is
+  measured: components smaller than the governed minimum print-area fraction
+  are background noise (a purple-lit sky, neon, a sunset) and are ignored;
+  among the plausible components the largest must be at least 4× every
+  other, otherwise no single marker can be isolated. The quadrilateral,
+  its fill ratio (≥ 0.85) and the ring around it are computed from that one
+  component only; scene pixels outside it are never counted, removed or
+  reconstructed. No marker, too small, too large, more than one plausible
+  component, not a solid convex panel, or touching the image edge → the
+  scene is unusable (reroll). The placement records the component
+  statistics (`placeholder.components`).
 - **B. Garment appearance under the marker.** Reconstructed from the
   surrounding shirt pixels by deterministic harmonic interpolation: the ring
   of garment just outside the marker is the boundary condition, a Laplace
@@ -305,7 +345,8 @@ successful. Deterministic checks, computed: image size; art identity
 (the final equals a fresh recomposite of base scene + approved source +
 recorded placement, so spelling, internal geometry and content are preserved
 by construction and any post-edit is caught); marker removed before
-placement (zero chroma pixels in the reconstructed base); no residual chroma
+placement (zero chroma pixels in the reconstructed base within the isolated
+marker component; chroma elsewhere in the scene is scenery); no residual chroma
 leak (zero chroma pixels in the final where the marker was and the art does
 not cover); shading derived from the reconstruction, not the marker; no
 upscale; aspect preserved; placement within bounds; single placement, no
@@ -465,6 +506,7 @@ Return exactly one JSON object:
   "verification": { "queue_verified": false, "human_approval_verified": false, "source_verified": false, "handoff_verified": false, "product_spec_verified": false, "pricing_verified": false, "budget_verified": false, "qa_passed": false, "campaign_verified": false },
   "rendering": { "provider": "", "model": "", "size": "", "quality_mix": { "high": 2, "medium": 4 }, "mode": "composited_fidelity" },
   "authorization": { "received": false, "evidence": "" },
+  "prior_failed_jobs": [ { "render_job_id": "", "folder": "", "result": "", "rerolls": 0, "estimated_api_cost_usd": 0, "attribution": "generation | validator-defect", "validator_defect": null, "warnings": [] } ],
   "proposed_expense_log_row": {}, "warnings": [], "checks": [], "human_action_required": null
 }
 ```
@@ -500,6 +542,17 @@ for every job that ran. `human_action_required` is `null` for
 | `VERIFICATION_FAILED` | partial | failed job | The package did not verify; nothing published |
 
 ## Pitfalls
+
+- **The marker was clearly solid but the fill ratio came out 0.3.** Before
+  2026-10-02 this was the validator measuring purple scenery as marker. It
+  now isolates the connected chest marker first; the scene's other magenta
+  pixels are ignored. If a scene still fails, read the reason: too small,
+  more than one plausible component, not a solid panel, touching the edge,
+  or the separate garment-ring check.
+- **The job failed on a validator defect; reroll it for free.** There is no
+  free job. A human records the ruling beside the failed folder, and a new
+  job runs under a fresh exact authorization with the normal cap and the
+  normal budget.
 
 - **"Render it" or "Proceed" after a proposal.** Not the command.
 - **The handoff is missing but `art_path` points at a file.** Never fetched.
@@ -606,6 +659,7 @@ Input: `Render the listing campaign for 1901-093.` Zero generation calls, no cam
   "received": false,
   "evidence": ""
  },
+ "prior_failed_jobs": [],
  "proposed_expense_log_row": {
   "design_id": "1901-093",
   "model": "mock/mock-image-1",
@@ -790,6 +844,7 @@ Input: `AUTHORIZE LISTING RENDER 1901-093`, in a new run. Six scenes, six determ
   "received": true,
   "evidence": "AUTHORIZE LISTING RENDER 1901-093"
  },
+ "prior_failed_jobs": [],
  "proposed_expense_log_row": {
   "design_id": "1901-093",
   "model": "mock/mock-image-1",
@@ -1108,6 +1163,7 @@ Target `1901-093`; input `AUTHORIZE LISTING RENDER 1901-094`.
   "received": false,
   "evidence": ""
  },
+ "prior_failed_jobs": [],
  "proposed_expense_log_row": {
   "design_id": "1901-093",
   "model": "mock/mock-image-1",
@@ -1292,6 +1348,7 @@ Scene 2 came back with no usable print area; one reroll, counted and costed.
   "received": true,
   "evidence": "AUTHORIZE LISTING RENDER 1901-093"
  },
+ "prior_failed_jobs": [],
  "proposed_expense_log_row": {
   "design_id": "1901-093",
   "model": "mock/mock-image-1",
@@ -1623,6 +1680,7 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
   "received": true,
   "evidence": "AUTHORIZE LISTING RENDER 1901-093"
  },
+ "prior_failed_jobs": [],
  "proposed_expense_log_row": {
   "design_id": "1901-093",
   "model": "mock/mock-image-1",
@@ -1879,6 +1937,7 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
   "received": false,
   "evidence": ""
  },
+ "prior_failed_jobs": [],
  "proposed_expense_log_row": {},
  "warnings": [],
  "checks": [
@@ -2009,6 +2068,7 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
   "received": false,
   "evidence": ""
  },
+ "prior_failed_jobs": [],
  "proposed_expense_log_row": {},
  "warnings": [],
  "checks": [
@@ -2139,6 +2199,7 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
   "received": false,
   "evidence": ""
  },
+ "prior_failed_jobs": [],
  "proposed_expense_log_row": {},
  "warnings": [],
  "checks": [
@@ -2249,6 +2310,7 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
   "received": false,
   "evidence": ""
  },
+ "prior_failed_jobs": [],
  "proposed_expense_log_row": {},
  "warnings": [],
  "checks": [
@@ -2359,6 +2421,7 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
   "received": false,
   "evidence": ""
  },
+ "prior_failed_jobs": [],
  "proposed_expense_log_row": {},
  "warnings": [],
  "checks": [
@@ -2484,6 +2547,7 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
   "received": false,
   "evidence": ""
  },
+ "prior_failed_jobs": [],
  "proposed_expense_log_row": {},
  "warnings": [],
  "checks": [
@@ -2589,6 +2653,7 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
   "received": false,
   "evidence": ""
  },
+ "prior_failed_jobs": [],
  "proposed_expense_log_row": {},
  "warnings": [],
  "checks": [
@@ -2696,6 +2761,7 @@ The hero composite was modified after compositing (simulated re-lettering); the 
   "received": true,
   "evidence": "AUTHORIZE LISTING RENDER 1901-093"
  },
+ "prior_failed_jobs": [],
  "proposed_expense_log_row": {
   "design_id": "1901-093",
   "model": "mock/mock-image-1",
@@ -2902,6 +2968,7 @@ The reconstructed base still held marker pixels (simulated); deterministic QA re
   "received": true,
   "evidence": "AUTHORIZE LISTING RENDER 1901-093"
  },
+ "prior_failed_jobs": [],
  "proposed_expense_log_row": {
   "design_id": "1901-093",
   "model": "mock/mock-image-1",
@@ -3032,7 +3099,7 @@ The reconstructed base still held marker pixels (simulated); deterministic QA re
   {
    "check": "scene_1",
    "status": "FAIL",
-   "detail": "deterministic QA: marker_removed_before_placement 169 marker pixels remain in the reconstructed base; no_residual_chroma_leak 169 chroma pixels remain where the marker was and the art does not cover"
+   "detail": "deterministic QA: marker_removed_before_placement 169 marker pixels remain in the reconstructed base within the isolated chest-marker component; scene pixels outside the marker are not touched; no_residual_chroma_leak 169 chroma pixels remain where the marker was and the art does not cover"
   },
   {
    "check": "failed_job",
@@ -3041,6 +3108,215 @@ The reconstructed base still held marker pixels (simulated); deterministic QA re
   }
  ],
  "human_action_required": "Scene 1 for 1901-093 failed deterministic QA; the campaign was not published. Review the failed job artifacts."
+}
+```
+
+### O. Prior failed job ruled a validator defect: proposal with attribution
+
+`_failed/1901-093-oldjob0001/` holds a job that failed on the marker-validation defect, and a human recorded `1901-093-oldjob0001.validator-defect.json` beside it. The proposal lists it with attribution `validator-defect`; the new job still needs its own exact command, starts at 0 rerolls, and its spend counts.
+
+```json
+{
+ "design_id": "1901-093",
+ "result": "AWAITING_RENDER_AUTHORIZATION",
+ "render_performed": false,
+ "render_job_id": "",
+ "timestamp": "2026-10-01T02:00:00Z",
+ "source": {
+  "drive_file_id": "1WloiO2PNmvIZHQWBsYyYjqDCQOlae6Ve",
+  "filename": "1901-093-B.png",
+  "sha256": "5211ed2ff15b370ae478caafe34bb2d55abb60a4fdd8f79521af2a8d416f2916",
+  "staged_path": "/home/claude/agents/1901/shared/render-handoffs/1901-093/source/1901-093-B.png"
+ },
+ "product": {
+  "blank": "Comfort Colors 1717 Garment-Dyed Heavyweight T-Shirt",
+  "provider": "Printify / Monster Digital",
+  "color": "Pepper",
+  "spec_source": "Idea Queue row 95 + 01 — 1901 Listing Render System (CURRENT) §Product"
+ },
+ "campaign": {
+  "root": "/home/claude/agents/1901/shared/render-campaigns/",
+  "design_folder": "/home/claude/agents/1901/shared/render-campaigns/1901-093",
+  "manifest_path": "/home/claude/agents/1901/shared/render-campaigns/1901-093/manifest.json",
+  "qa_path": "/home/claude/agents/1901/shared/render-campaigns/1901-093/qa/qa.json",
+  "contact_sheet_path": "/home/claude/agents/1901/shared/render-campaigns/1901-093/qa/contact-sheet.png",
+  "images": [
+   "01-hero.png",
+   "02-story.png",
+   "03-travel.png",
+   "04-flatlay.png",
+   "05-folded.png",
+   "06-detail.png"
+  ]
+ },
+ "budget": {
+  "per_listing_limit_usd": 2.0,
+  "monthly_limit_usd": 25.0,
+  "estimated_job_cost_usd": 0.6,
+  "monthly_recorded_cost_usd": 3.1,
+  "projected_monthly_cost_usd": 3.7,
+  "budget_flag": "OK"
+ },
+ "verification": {
+  "queue_verified": true,
+  "human_approval_verified": true,
+  "source_verified": true,
+  "handoff_verified": true,
+  "product_spec_verified": true,
+  "pricing_verified": true,
+  "budget_verified": true,
+  "qa_passed": false,
+  "campaign_verified": false
+ },
+ "rendering": {
+  "provider": "mock",
+  "model": "mock-image-1",
+  "size": "1024x1024",
+  "quality_mix": {
+   "high": 2,
+   "medium": 4
+  },
+  "mode": "composited_fidelity"
+ },
+ "authorization": {
+  "received": false,
+  "evidence": ""
+ },
+ "prior_failed_jobs": [
+  {
+   "render_job_id": "oldjob0001",
+   "folder": "/home/claude/agents/1901/shared/render-campaigns/_failed/1901-093-oldjob0001",
+   "result": "QA_FAILED",
+   "rerolls": 4,
+   "estimated_api_cost_usd": 0.2884,
+   "attribution": "validator-defect",
+   "validator_defect": {
+    "design_id": "1901-093",
+    "render_job_id": "oldjob0001",
+    "defect": "Scene 1 marker validation combined every magenta-coloured pixel in the image; background pixels inflated the inferred polygon (fill 0.23-0.37 vs 0.99-1.02 for the connected marker)",
+    "corrected_in": "<commit>",
+    "ruled_by": "Jody Clements (Architect)",
+    "ruled_at": "2026-10-02"
+   },
+   "warnings": []
+  }
+ ],
+ "proposed_expense_log_row": {
+  "design_id": "1901-093",
+  "model": "mock/mock-image-1",
+  "size": "1024x1024",
+  "quality_mix": {
+   "high": 2,
+   "medium": 4
+  },
+  "source_drive_id": "1WloiO2PNmvIZHQWBsYyYjqDCQOlae6Ve",
+  "source_sha256": "5211ed2ff15b370ae478caafe34bb2d55abb60a4fdd8f79521af2a8d416f2916",
+  "pricing_snapshot": {
+   "provider": "mock",
+   "model": "mock-image-1",
+   "size": "1024x1024",
+   "captured_at": "2026-10-01T00:00:00Z",
+   "basis": "fixture pricing for tests",
+   "currency": "USD",
+   "per_image_usd": {
+    "high": {
+     "1024x1024": 0.2
+    },
+    "medium": {
+     "1024x1024": 0.05
+    }
+   }
+  },
+  "campaign_folder": "/home/claude/agents/1901/shared/render-campaigns/1901-093",
+  "render_job_id": "",
+  "started_at": "",
+  "completed_at": "",
+  "images_generated": 0,
+  "rerolls": 0,
+  "usage_record": [],
+  "estimated_api_cost_usd": 0.6,
+  "job_status": "PROPOSED",
+  "budget_flag": "OK",
+  "notes": [
+   "proposal only; no generation call made",
+   "retry after validator defect in job oldjob0001 (Scene 1 marker validation combined every magenta-coloured pixel in the image; background pixels inflated the inferred polygon (fill 0.23-0.37 vs 0.99-1.02 for the connected marker); corrected in <commit>; ruled by Jody Clements (Architect) on 2026-10-02): that job's 4 reroll(s) were caused by the defect, not by generation; this job's reroll allowance is the normal 4 and its spend counts as usual"
+  ],
+  "actual_billed_cost_usd": null
+ },
+ "warnings": [],
+ "checks": [
+  {
+   "check": "input",
+   "status": "PASS",
+   "detail": "design_id '1901-093' (trimmed)"
+  },
+  {
+   "check": "queue_read",
+   "status": "PASS",
+   "detail": "exactly one row (sheet row 95) carries id 1901-093"
+  },
+  {
+   "check": "human_approval",
+   "status": "PASS",
+   "detail": "human_decision is exactly APPROVE and status is exactly Approved"
+  },
+  {
+   "check": "source_identity",
+   "status": "PASS",
+   "detail": "render_source_path and the resolver name the same Drive file 1WloiO2PNmvIZHQWBsYyYjqDCQOlae6Ve"
+  },
+  {
+   "check": "governance",
+   "status": "PASS",
+   "detail": "1901-prepare-production-handoff reports no unresolved blocker for this design"
+  },
+  {
+   "check": "staged_handoff",
+   "status": "PASS",
+   "detail": "handoff valid: manifest, authority, integrity and SHA-256 all verified"
+  },
+  {
+   "check": "source_image",
+   "status": "PASS",
+   "detail": "1400x1000px, bands RGBA, alpha=yes"
+  },
+  {
+   "check": "product_spec",
+   "status": "PASS",
+   "detail": "Comfort Colors 1717 Garment-Dyed Heavyweight T-Shirt / Printify / Monster Digital / Pepper from Idea Queue row 95 + 01 — 1901 Listing Render System (CURRENT) §Product"
+  },
+  {
+   "check": "model_quality",
+   "status": "PASS",
+   "detail": "mock / mock-image-1: credentials present, model verified available, high and medium at 1024x1024 per the configured capability record"
+  },
+  {
+   "check": "pricing",
+   "status": "PASS",
+   "detail": "mock / mock-image-1 / 1024x1024 captured 2026-10-01T00:00:00Z: high $0.2000, medium $0.0500 per image (fixture pricing for tests)"
+  },
+  {
+   "check": "budget",
+   "status": "PASS",
+   "detail": "planned campaign $0.6000 ≤ $2.00; month $3.1000 → $3.7000 ≤ $25.00"
+  },
+  {
+   "check": "existing_campaign",
+   "status": "PASS",
+   "detail": "no campaign folder exists for this design"
+  },
+  {
+   "check": "prior_failed_jobs",
+   "status": "INFO",
+   "detail": "oldjob0001: QA_FAILED, 4 reroll(s), $0.2884, attribution validator-defect (corrected in <commit>); artifacts preserved under _failed; a new job needs its own exact authorization"
+  },
+  {
+   "check": "authorization",
+   "status": "FAIL",
+   "detail": "the current run does not contain the exact command AUTHORIZE LISTING RENDER 1901-093; ordinary requests and vague confirmations never authorize rendering"
+  }
+ ],
+ "human_action_required": "No generation call made and no campaign files created. 1901-093 is eligible: source 1901-093-B.png (Drive id 1WloiO2PNmvIZHQWBsYyYjqDCQOlae6Ve, sha256 5211ed2ff15b…) staged at /home/claude/agents/1901/shared/render-handoffs/1901-093/source/1901-093-B.png; product Comfort Colors 1717 Garment-Dyed Heavyweight T-Shirt / Printify / Monster Digital / Pepper; six scenes (2 high, 4 medium) at 1024x1024 on mock / mock-image-1 at an estimated $0.6000, month $3.1000 → $3.7000; output /home/claude/agents/1901/shared/render-campaigns/1901-093. To authorize exactly this render job, send exactly: AUTHORIZE LISTING RENDER 1901-093"
 }
 ```
 

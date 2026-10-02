@@ -129,9 +129,6 @@ e, p = Env(), provider(script=["error"]); T("N7", "provider error", run(e, evide
 e, p = Env(), provider(script=["ok", "no_placeholder", "ok"]); assert run(e, evidence(), AUTH, p)["result"] == "READY_FOR_HUMAN_RENDER_REVIEW"
 o = run(e, evidence(), "Proceed.", p, jid="x"); assert o["result"] == "ALREADY_RENDERED" and len(p.calls) == 7; print(" P1. PASS prior-run authorization does not carry; no regeneration"); e.done()
 print("ALL PASS")
-if "--dump" in sys.argv:
-    for n in (1, 2, 4, 14, 13, 22, 23, 8, 9, 11, 18, 19, 20):
-        open(f"ex{n}.json", "w").write(json.dumps(examples[n], indent=1, ensure_ascii=False) + "\n")
 
 # ---- production-readiness patch: marker geometry vs shading reconstruction; configurable model ----
 import io
@@ -201,4 +198,73 @@ os.environ["OPENAI_API_KEY"] = "fixture-primary"; assert oa.credential_env_name(
 for k in ("OPENAI_API_KEY", "LISTING_STUDIO_OPENAI_API_KEY"): os.environ.pop(k, None)
 assert "credential_env_name" in oa.preflight() and oa.preflight()["credential_env_name"] is None
 print(" M14. PASS credential resolves from OPENAI_API_KEY, else LISTING_STUDIO_OPENAI_API_KEY; preflight reports the name only; no network call without a key")
+# ---- marker isolation patch (job 4c8fda750c false positives): connected-component selection ----
+# M15 background magenta/purple pixels never move the quad: purple_bg scene detects the same quad and pixel count as the clean scene
+clean = _pv.draw_scene("1024x1024", (72, 70, 68), 1); noisy = _pv.draw_scene("1024x1024", (72, 70, 68), 1, behaviour="purple_bg")
+qc, ic = _c.find_marker_quad(clean); qn, inf = _c.find_marker_quad(noisy)
+assert _c.marker_pixels(noisy) > _c.marker_pixels(clean) + 1000, "fixture must contain background chroma"
+assert qn == qc and inf["pixels"] == ic["pixels"] and inf["fill_ratio"] == ic["fill_ratio"] >= 0.95 and inf["components"]["plausible"] == 1 and inf["components"]["ignored"] >= 5 and inf["components"]["ignored_pixels"] > 1000 and ic["components"]["ignored"] == 0, (qn, qc, inf)
+print(" M15. PASS background chroma components are ignored: identical quad, pixel count and fill ratio as the clean scene")
+# M15b full run with a purple-background hero: no reroll, QA PASS (marker removed within the component; background chroma untouched and not a leak)
+e, p = Env(), provider(script=["purple_bg"]); o = run(e, evidence(), AUTH, p)
+T("M15b", "purple-background hero renders without a reroll", o, "READY_FOR_HUMAN_RENDER_REVIEW", True, e, p, calls=6, extra=lambda o, e: (o["proposed_expense_log_row"]["rerolls"] == 0 and json.load(open(os.path.join(e.C, "1901-093/qa/qa.json")))["images"][0]["checks"]["marker_removed_before_placement"]["result"] == "PASS") or sys.exit("M15b"))
+# M16 malformed / fragmented / missing / tiny / edge markers still fail closed → reroll, with the specific reason
+for beh, needle in (("hollow", "not a solid convex panel"), ("fragmented", "cannot be isolated"), ("no_marker", "no print-area marker"), ("tiny", "too small"), ("edge", "cannot be reconstructed")):
+    e, p = Env(), provider(script=[beh]); o = run(e, evidence(), AUTH, p)
+    T(f"M16-{beh}", f"{beh} marker rerolls", o, "READY_FOR_HUMAN_RENDER_REVIEW", True, e, p, calls=7, extra=lambda o, e, n=needle: (o["proposed_expense_log_row"]["rerolls"] == 1 and n in [c for c in o["checks"] if c["check"] == "scene_1"][0]["detail"]) or sys.exit("M16 " + n))
+# M16b fragmented + background noise: still ambiguous (two plausible components, dominance below 4x), not rescued by the noise filter
+img = _pv.draw_scene("1024x1024", (72, 70, 68), 1, behaviour="fragmented"); q, why = _c.find_marker_quad(img); assert q is None and "more than one plausible" in why, why
+print(" M16b. PASS two comparable components: no dominant marker, fail closed")
+# M16c the dominance rule: a second plausible component just under 1/4 of the marker is ignored; at 1/3 it is ambiguous
+from PIL import ImageDraw as _ID
+for frac, expect in ((0.20, True), (0.34, False)):
+    img = _pv.draw_scene("1024x1024", (72, 70, 68), 1); d = _ID.Draw(img); mp = _c.find_marker_quad(img)[1]["pixels"]; side = int((mp * frac) ** 0.5)
+    d.rectangle([40, 40, 40 + side, 40 + side], fill=config.PLACEHOLDER_RGB); q, info = _c.find_marker_quad(img)
+    assert (q is not None) is expect, (frac, info)
+    if expect: assert info["pixels"] == mp and info["components"]["plausible"] == 1 and info["components"]["ignored"] == 1 and info["components"]["largest_ignored_pixels"] == (side + 1) ** 2, info
+    else: assert "more than one plausible" in info, info
+print(" M16c. PASS a second magenta block below the 2% floor is noise and ignored; above it (1/3 of the marker, dominance < 4) the scene is unusable")
+# M17 the five failed hero attempts of job 4c8fda750c (read-only on the failed job; skipped when absent)
+import regression_4c8fda750c as _rg; assert _rg.main() == 0
+print(" M17. PASS regression on job 4c8fda750c artifacts (or SKIP when absent)")
+# ---- reroll accounting after a confirmed validator defect ----
+def failed_fixture(e, job_id="oldjob0001", rerolls=4, cost=0.2884, defect=True, **over):
+    fr = os.path.join(e.C, "_failed", f"1901-093-{job_id}"); os.makedirs(os.path.join(fr, "generated-scenes"))
+    json.dump({"result": "QA_FAILED", "detail": "scene unusable (print-area marker is not a solid convex panel (fill ratio 0.33)) and the reroll cap of 4 is reached", "design_id": "1901-093", "render_job_id": job_id, "downstream_ready": False}, open(os.path.join(fr, "FAILED.json"), "w"))
+    json.dump({"render_job_id": job_id, "design_id": "1901-093", "started_at": NOW, "rerolls": rerolls, "estimated_api_cost_usd": cost, "images_generated": 1 + rerolls, "job_status": "FAILED:QA_FAILED"}, open(os.path.join(fr, "cost-log.json"), "w"))
+    open(os.path.join(fr, "generated-scenes", "01-hero-base.png"), "wb").write(b"fixture")
+    if defect is not None:
+        d = {"design_id": "1901-093", "render_job_id": job_id, "defect": "Scene 1 marker validation combined every magenta-coloured pixel in the image; background pixels inflated the inferred polygon (fill 0.23-0.37 vs 0.99-1.02 for the connected marker)", "corrected_in": "<commit>", "ruled_by": "Jody Clements (Architect)", "ruled_at": "2026-10-02", "scope": "validator-defect"}
+        d.update(over); json.dump(d, open(fr + ".validator-defect.json", "w"))
+    return fr
+def snapshot(fr): return {p_: (open(p_, "rb").read(), os.stat(p_).st_mtime_ns) for d_, _, fs in os.walk(fr) for f in fs for p_ in [os.path.join(d_, f)]}
+# R1 proposal lists the prior failed job with validator-defect attribution; spend still counts; nothing in _failed touched
+e, p = Env(), provider(); fr = failed_fixture(e); snap_ = snapshot(fr); o = run(e, evidence(monthly=3.10), ASK, p)
+pj = o["prior_failed_jobs"]; assert len(pj) == 1 and pj[0]["render_job_id"] == "oldjob0001" and pj[0]["attribution"] == "validator-defect" and pj[0]["rerolls"] == 4 and pj[0]["validator_defect"]["corrected_in"] == "<commit>" and pj[0]["warnings"] == []
+assert o["budget"]["monthly_recorded_cost_usd"] == 3.10 and any("validator defect" in n for n in o["proposed_expense_log_row"]["notes"]) and any(c["check"] == "prior_failed_jobs" and "attribution validator-defect" in c["detail"] for c in o["checks"])
+assert o["result"] == "AWAITING_RENDER_AUTHORIZATION" and len(p.calls) == 0 and snapshot(fr) == snap_
+examples["R1"] = o; print(" R1. PASS proposal reports the prior failed job as validator-defect attributed; no call; failed artifacts untouched")
+# R1b the retry still needs the exact command; then runs with a fresh allowance of 4, its cost log carrying the attribution note
+o = run(e, evidence(monthly=3.10), "Proceed.", p); assert o["result"] == "AWAITING_RENDER_AUTHORIZATION" and len(p.calls) == 0
+o = run(e, evidence(monthly=3.10), AUTH, p, jid="newjob0001"); assert o["result"] == "READY_FOR_HUMAN_RENDER_REVIEW" and len(p.calls) == 6 and o["proposed_expense_log_row"]["rerolls"] == 0
+c = json.load(open(os.path.join(e.C, "1901-093/cost-log.json"))); assert any("validator defect in job oldjob0001" in n for n in c["notes"]) and c["rerolls"] == 0 and snapshot(fr) == snap_ and os.path.isdir(fr)
+print(" R1b. PASS retry needs a fresh exact authorization; new job starts at 0 rerolls; attribution recorded in its cost log; prior failed job preserved"); e.done()
+# R2 the reroll cap is unchanged on a retry: four ordinary bad generations and a fifth still stop the job
+e, p = Env(), provider(script=["hollow", "fragmented", "no_marker", "tiny", "hollow"]); failed_fixture(e); o = run(e, evidence(), AUTH, p)
+T("R2", "retry after a defect ruling still caps ordinary rerolls at 4", o, "QA_FAILED", False, e, p, calls=5, extra=lambda o, e: (o["proposed_expense_log_row"]["rerolls"] == 4 and "reroll cap" in [c for c in o["checks"] if c["check"] == "scene_1"][-1]["detail"]) or sys.exit("R2"))
+# R3 no ruling → ordinary attribution; a ruling naming another job, missing fields, or unreadable → ordinary with a warning; never a bypass
+for label, kw in (("no record", {"defect": None}), ("other job id", {"render_job_id": "someoneelse"}), ("missing corrected_in", {"corrected_in": ""}), ("missing ruler", {"ruled_by": ""})):
+    e, p = Env(), provider(); fr = failed_fixture(e, **kw); o = run(e, evidence(), ASK, p)
+    assert o["prior_failed_jobs"][0]["attribution"] == "generation" and o["prior_failed_jobs"][0]["validator_defect"] is None and not any("validator defect" in n for n in o["proposed_expense_log_row"]["notes"]), label
+    assert (o["prior_failed_jobs"][0]["warnings"] == []) == (label == "no record"), label
+    e.done()
+e, p = Env(), provider(); fr = failed_fixture(e, defect=None); open(fr + ".validator-defect.json", "w").write("{not json"); o = run(e, evidence(), ASK, p)
+assert o["prior_failed_jobs"][0]["attribution"] == "generation" and any("unreadable" in w for w in o["prior_failed_jobs"][0]["warnings"]); e.done()
+print(" R3. PASS attribution is validator-defect only with a complete ruling naming the exact job; otherwise ordinary, with a warning")
+# R4 a failed job's spend stays in the monthly floor whatever its attribution
+e, p = Env(), provider(); failed_fixture(e, cost=5.0); o = run(e, evidence(monthly=1.0), ASK, p); assert o["budget"]["monthly_recorded_cost_usd"] == 5.0 and any("Local cost logs" in w for w in o["warnings"]); e.done()
+print(" R4. PASS a validator-defect job's spend still counts toward the monthly cap")
 print("ALL PATCH TESTS PASS")
+if "--dump" in sys.argv:
+    for n in (1, 2, 4, 14, 13, 22, 23, 8, 9, 11, 18, 19, 20, "M4", "R1"):
+        open(os.path.join(HERE, f"ex{n}.json"), "w").write(json.dumps(examples[n], indent=1, ensure_ascii=False) + "\n")

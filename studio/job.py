@@ -55,6 +55,50 @@ def local_month_spend(campaign_root, month_prefix):
     return round(total, 6)
 
 
+DEFECT_KEYS = ("design_id", "render_job_id", "defect", "corrected_in", "ruled_by", "ruled_at")
+
+
+def prior_failed_jobs(campaign_root, design_id):
+    """Failed jobs of this design under _failed/, read-only, each with its FAILED.json result, its reroll count
+    and spend from cost-log.json, and its attribution. Attribution is "generation" unless a human has recorded a
+    validator-defect ruling beside the folder as <design_id>-<render_job_id>.validator-defect.json naming that
+    exact job, the defect, the commit that corrected it, who ruled and when; anything less is ignored with a
+    warning. The failed folder itself is never modified."""
+    failed_root = os.path.join(campaign_root, "_failed"); jobs = []
+    if not os.path.isdir(failed_root):
+        return jobs
+    for name in sorted(os.listdir(failed_root)):
+        folder = os.path.join(failed_root, name)
+        if not name.startswith(design_id + "-") or not os.path.isdir(folder):
+            continue
+        job_id = name[len(design_id) + 1:]
+        rec = {"render_job_id": job_id, "folder": folder, "result": None, "rerolls": None, "estimated_api_cost_usd": None, "attribution": "generation", "validator_defect": None, "warnings": []}
+        try:
+            rec["result"] = json.load(open(os.path.join(folder, "FAILED.json"), encoding="utf-8")).get("result")
+        except Exception:  # noqa: BLE001
+            rec["warnings"].append("FAILED.json unreadable")
+        try:
+            c = json.load(open(os.path.join(folder, "cost-log.json"), encoding="utf-8")); rec["rerolls"] = c.get("rerolls"); rec["estimated_api_cost_usd"] = c.get("estimated_api_cost_usd")
+        except Exception:  # noqa: BLE001
+            rec["warnings"].append("cost-log.json unreadable")
+        dpath = folder + ".validator-defect.json"
+        if os.path.isfile(dpath):
+            try:
+                d = json.load(open(dpath, encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                d = None; rec["warnings"].append("validator-defect record unreadable; treated as an ordinary failure")
+            if isinstance(d, dict):
+                missing = [k for k in DEFECT_KEYS if not isinstance(d.get(k), str) or not d.get(k).strip()]
+                if missing or d["design_id"] != design_id or d["render_job_id"] != job_id:
+                    rec["warnings"].append("validator-defect record does not name this exact job with design_id, render_job_id, defect, corrected_in, ruled_by and ruled_at; treated as an ordinary failure")
+                else:
+                    rec["attribution"] = "validator-defect"; rec["validator_defect"] = {k: d[k].strip() for k in DEFECT_KEYS}
+            elif d is not None:
+                rec["warnings"].append("validator-defect record is not a JSON object; treated as an ordinary failure")
+        jobs.append(rec)
+    return jobs
+
+
 def inspect_existing(campaign_root, design_id, source_sha, product):
     folder = os.path.join(campaign_root, design_id)
     if not os.path.isdir(folder):
@@ -86,7 +130,7 @@ def run(design_id, evidence, message, provider, handoff_root=config.HANDOFF_ROOT
            "budget": {"per_listing_limit_usd": config.PER_LISTING_LIMIT_USD, "monthly_limit_usd": config.MONTHLY_LIMIT_USD, "estimated_job_cost_usd": 0, "monthly_recorded_cost_usd": 0, "projected_monthly_cost_usd": 0, "budget_flag": ""},
            "verification": {"queue_verified": False, "human_approval_verified": False, "source_verified": False, "handoff_verified": False, "product_spec_verified": False, "pricing_verified": False, "budget_verified": False, "qa_passed": False, "campaign_verified": False},
            "rendering": {"provider": provider.name, "model": provider.model, "size": provider.size, "quality_mix": config.QUALITY_MIX, "mode": "composited_fidelity"},
-           "authorization": {"received": False, "evidence": ""}, "proposed_expense_log_row": {}, "warnings": [], "checks": [], "human_action_required": None}
+           "authorization": {"received": False, "evidence": ""}, "prior_failed_jobs": [], "proposed_expense_log_row": {}, "warnings": [], "checks": [], "human_action_required": None}
     checks, warnings, ver = out["checks"], out["warnings"], out["verification"]
     def chk(name, status, detail): checks.append({"check": name, "status": status, "detail": detail})
     def done(result, action=None): out["result"] = result; out["human_action_required"] = action; return out
@@ -249,13 +293,26 @@ def run(design_id, evidence, message, provider, handoff_root=config.HANDOFF_ROOT
         chk("existing_campaign", "PASS", exdetail); return done("ALREADY_RENDERED", None)
     chk("existing_campaign", "PASS", "no campaign folder exists for this design")
 
+    # 9b prior failed jobs of this design (read-only): their spend already counts in the monthly floor above; their
+    # rerolls never carry into a new job. A human-recorded validator-defect ruling marks a job whose rerolls were
+    # consumed by a corrected internal defect rather than by generation; it is reported, never acted on automatically.
+    prior = prior_failed_jobs(campaign_root, did); out["prior_failed_jobs"] = prior
+    retry_notes = []
+    for pj in prior:
+        for w in pj["warnings"]: warnings.append(f"failed job {pj['render_job_id']}: {w}")
+        if pj["attribution"] == "validator-defect":
+            vd = pj["validator_defect"]
+            retry_notes.append(f"retry after validator defect in job {pj['render_job_id']} ({vd['defect']}; corrected in {vd['corrected_in']}; ruled by {vd['ruled_by']} on {vd['ruled_at']}): that job's {pj['rerolls']} reroll(s) were caused by the defect, not by generation; this job's reroll allowance is the normal {config.MAX_REROLLS} and its spend counts as usual")
+    if prior:
+        chk("prior_failed_jobs", "INFO", "; ".join(f"{pj['render_job_id']}: {pj['result']}, {pj['rerolls']} reroll(s), ${float(pj['estimated_api_cost_usd'] or 0):.4f}, attribution {pj['attribution']}" + (f" (corrected in {pj['validator_defect']['corrected_in']})" if pj["validator_defect"] else "") for pj in prior) + "; artifacts preserved under _failed; a new job needs its own exact authorization")
+
     row_base = {"design_id": did, "model": f"{provider.name}/{provider.model}", "size": size, "quality_mix": config.QUALITY_MIX, "source_drive_id": info["drive_file_id"], "source_sha256": info["sha256"], "pricing_snapshot": snap, "campaign_folder": folder}
 
     # 10 authorization
     if not (auth and auth[0] == "OK"):
         if auth: chk("authorization", "FAIL", f"the command names {auth[1]}, not the target {did}; it authorizes nothing in this run")
         else: chk("authorization", "FAIL", f"the current run does not contain the exact command AUTHORIZE LISTING RENDER {did}; ordinary requests and vague confirmations never authorize rendering")
-        out["proposed_expense_log_row"] = {**row_base, "render_job_id": "", "started_at": "", "completed_at": "", "images_generated": 0, "rerolls": 0, "usage_record": [], "estimated_api_cost_usd": estimate, "job_status": "PROPOSED", "budget_flag": "OK", "notes": ["proposal only; no generation call made"], "actual_billed_cost_usd": None}
+        out["proposed_expense_log_row"] = {**row_base, "render_job_id": "", "started_at": "", "completed_at": "", "images_generated": 0, "rerolls": 0, "usage_record": [], "estimated_api_cost_usd": estimate, "job_status": "PROPOSED", "budget_flag": "OK", "notes": ["proposal only; no generation call made"] + retry_notes, "actual_billed_cost_usd": None}
         out["campaign"]["images"] = [f"{p['slot']:02d}-{p['key']}.png" for p in plan]
         return done("AWAITING_RENDER_AUTHORIZATION", f"No generation call made and no campaign files created. {did} is eligible: source {info['filename']} (Drive id {info['drive_file_id']}, sha256 {info['sha256'][:12]}…) staged at {info['staged_path']}; product {product['blank']} / {product['provider']} / {product['color']}; six scenes (2 high, 4 medium) at {size} on {provider.name} / {provider.model} at an estimated ${estimate:.4f}, month ${monthly:.4f} → ${whole['projected_monthly']:.4f}; output {folder}. To authorize exactly this render job, send exactly: AUTHORIZE LISTING RENDER {did}")
     out["authorization"].update(received=True, evidence=auth[1]); chk("authorization", "PASS", f"current run contains the exact command: {auth[1]}")
@@ -268,7 +325,7 @@ def run(design_id, evidence, message, provider, handoff_root=config.HANDOFF_ROOT
         os.makedirs(os.path.join(tmp, sub), exist_ok=False)
     started = now
     cost = {"render_job_id": job_id, "design_id": did, "started_at": started, "completed_at": "", "model": row_base["model"], "size": size, "quality_mix": config.QUALITY_MIX, "images_generated": 0, "rerolls": 0,
-            "source_drive_id": info["drive_file_id"], "source_sha256": info["sha256"], "usage_record": [], "pricing_snapshot": snap, "estimated_api_cost_usd": 0, "campaign_folder": folder, "job_status": "RUNNING", "budget_flag": "OK", "notes": [], "actual_billed_cost_usd": None}
+            "source_drive_id": info["drive_file_id"], "source_sha256": info["sha256"], "usage_record": [], "pricing_snapshot": snap, "estimated_api_cost_usd": 0, "campaign_folder": folder, "job_status": "RUNNING", "budget_flag": "OK", "notes": list(retry_notes), "actual_billed_cost_usd": None}
     images, scene_prompts = [], {}
 
     def write_cost(status, flag="OK"):

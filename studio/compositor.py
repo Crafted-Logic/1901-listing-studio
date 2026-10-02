@@ -10,7 +10,7 @@ The exact approved artwork is fitted inside the quad with its aspect ratio prese
 perspective transform, and lit by multiplying the reconstructed garment luminance. Pixels of the
 art are only moved and lit; never redrawn. Every step is a pure function of (scene, art, placement)
 so QA can recompute the composite and compare pixel-for-pixel."""
-import io, math
+import hashlib, io, math
 from PIL import Image, ImageChops, ImageFilter
 
 from . import config
@@ -18,6 +18,7 @@ from . import config
 GRID = 56            # harmonic fill grid (long side)
 RING = 9             # width in px of the surrounding-shirt ring used as the boundary condition
 RING_MAX_CV = 0.35   # max coefficient of variation of ring luminance for a believable reconstruction
+MARKER_DOMINANCE = 4.0   # the chest marker must be at least this many times larger than any other plausible component
 
 
 def marker_mask(img):
@@ -29,14 +30,96 @@ def marker_pixels(img):
     return sum(marker_mask(img).convert("L").point(lambda v: 1 if v else 0).histogram()[1:])
 
 
-def find_marker_quad(img):
-    """Geometry only. Returns (quad [TL, TR, BR, BL], info) or (None, reason)."""
+def marker_components(mask):
+    """4-connected components of a marker mask. Returns (components sorted largest first, labels, width):
+    each component is {"id", "pixels", "bbox"}; labels[y * w + x] is the component id (0 = not marker).
+    Deterministic: raster-order discovery (C-speed skipping over unset pixels), iterative flood fill."""
+    w, h = mask.size; data = mask.convert("L").tobytes(); labels = bytearray(w * h); comps = []
+    big = {}                                                                   # component ids beyond 255 (never expected; kept exact)
+    pos = data.find(b"\xff")
+    while pos != -1:
+        if not labels[pos]:
+            cid = len(comps) + 1; tag = cid if cid < 255 else 255
+            if tag == 255: big[pos] = cid
+            labels[pos] = tag; stack = [pos]; n = 0
+            x0 = x2 = pos % w; y1 = y2 = pos // w; x1 = x0
+            while stack:
+                i = stack.pop(); n += 1; x, y = i % w, i // w
+                if x < x1: x1 = x
+                if x > x2: x2 = x
+                if y < y1: y1 = y
+                if y > y2: y2 = y
+                if x > 0 and data[i - 1] and not labels[i - 1]: labels[i - 1] = tag; stack.append(i - 1)
+                if x < w - 1 and data[i + 1] and not labels[i + 1]: labels[i + 1] = tag; stack.append(i + 1)
+                if y > 0 and data[i - w] and not labels[i - w]: labels[i - w] = tag; stack.append(i - w)
+                if y < h - 1 and data[i + w] and not labels[i + w]: labels[i + w] = tag; stack.append(i + w)
+            comps.append({"id": cid, "pixels": n, "bbox": [x1, y1, x2 + 1, y2 + 1]})
+        pos = data.find(b"\xff", pos + 1)
+    comps.sort(key=lambda c: (-c["pixels"], c["id"]))
+    return comps, labels, w
+
+
+_ISOLATE_CACHE = {}
+
+
+def _cached(img):
+    key = (img.size, img.mode, hashlib.sha1(img.tobytes()).hexdigest())
+    return key, _ISOLATE_CACHE.get(key)
+
+
+def isolate_marker(img):
+    """Select the one chest-marker component from the marker-colour mask, ignoring disconnected background
+    pixels that merely share the marker's colour. Returns (component mask as a '1' image, info) or
+    (None, reason). Selection is deterministic and by size only: components below the governed minimum
+    print-area fraction are noise; among the rest the largest must dominate every other by
+    MARKER_DOMINANCE, otherwise the marker cannot be isolated and the scene is unusable (fail closed)."""
+    key, hit = _cached(img)
+    if hit is not None: return hit
+    result = _isolate_marker(img)
+    if len(_ISOLATE_CACHE) > 32: _ISOLATE_CACHE.clear()
+    _ISOLATE_CACHE[key] = result
+    return result
+
+
+def _isolate_marker(img):
     w, h = img.size
     m = marker_mask(img)
-    bbox = m.getbbox()
-    if not bbox:
+    comps, labels, _ = marker_components(m)
+    if not comps:
         return None, "no print-area marker found in the scene"
-    px = m.load()
+    min_px = config.PLACEHOLDER_MIN_AREA * w * h
+    candidates = [c for c in comps if c["pixels"] >= min_px]
+    noise = [c for c in comps if c["pixels"] < min_px]
+    if not candidates:
+        return None, f"print-area marker too small ({comps[0]['pixels'] / float(w * h):.3%} of the image)"
+    if len(candidates) > 1 and candidates[0]["pixels"] < MARKER_DOMINANCE * candidates[1]["pixels"]:
+        return None, (f"more than one plausible print-area marker component ({', '.join(str(c['pixels']) for c in candidates[:4])} px); "
+                      f"the chest marker cannot be isolated")
+    sel = candidates[0]
+    frac = sel["pixels"] / float(w * h)
+    if frac > config.PLACEHOLDER_MAX_AREA:
+        return None, f"print-area marker too large ({frac:.1%} of the image)"
+    cid = sel["id"]
+    if cid >= 255:
+        return None, f"too many marker-coloured components ({len(comps)}); the chest marker cannot be isolated"
+    lab = Image.frombytes("L", (w, h), bytes(labels))
+    comp = lab.point(lambda v, c=cid: 255 if v == c else 0).convert("1")
+    info = {"pixels": sel["pixels"], "area_fraction": round(frac, 4), "bbox": list(sel["bbox"]),
+            "components": {"total": len(comps), "plausible": len(candidates), "ignored": len(comps) - 1,
+                           "ignored_pixels": sum(c["pixels"] for c in comps) - sel["pixels"],
+                           "largest_ignored_pixels": max((c["pixels"] for c in comps if c["id"] != cid), default=0),
+                           "dominance": round(sel["pixels"] / float(candidates[1]["pixels"]), 2) if len(candidates) > 1 else None,
+                           "selection": "largest component by pixel count; sub-minimum components are background noise"}}
+    return comp, info
+
+
+def find_marker_quad(img):
+    """Geometry only, from the isolated chest-marker component. Returns (quad [TL, TR, BR, BL], info) or (None, reason)."""
+    w, h = img.size
+    comp, info = isolate_marker(img)
+    if comp is None:
+        return None, info
+    bbox = info["bbox"]; px = comp.load()
     ms = mx = md = Md = None; count = 0
     for y in range(bbox[1], bbox[3]):
         for x in range(bbox[0], bbox[2]):
@@ -46,15 +129,13 @@ def find_marker_quad(img):
                 if mx is None or s > mx[0]: mx = (s, x, y)
                 if md is None or d < md[0]: md = (d, x, y)
                 if Md is None or d > Md[0]: Md = (d, x, y)
-    frac = count / float(w * h)
-    if frac < config.PLACEHOLDER_MIN_AREA: return None, f"print-area marker too small ({frac:.3%} of the image)"
-    if frac > config.PLACEHOLDER_MAX_AREA: return None, f"print-area marker too large ({frac:.1%} of the image)"
     quad = [(ms[1], ms[2]), (Md[1] + 1, Md[2]), (mx[1] + 1, mx[2] + 1), (md[1], md[2] + 1)]
     area = _shoelace(quad); fill = count / area if area else 0
     if fill < 0.85: return None, f"print-area marker is not a solid convex panel (fill ratio {fill:.2f})"
     if bbox[0] < RING + 2 or bbox[1] < RING + 2 or bbox[2] > w - RING - 2 or bbox[3] > h - RING - 2:
         return None, "print-area marker touches the image edge; no surrounding garment to reconstruct from"
-    return [(float(x), float(y)) for x, y in quad], {"pixels": count, "area_fraction": round(frac, 4), "fill_ratio": round(fill, 3), "bbox": list(bbox)}
+    info = dict(info, fill_ratio=round(fill, 3))
+    return [(float(x), float(y)) for x, y in quad], info
 
 
 def _shoelace(q):
@@ -149,7 +230,8 @@ def reconstruct_garment(scene, mask, bbox):
 def prepare_base(scene, placement):
     """Scene with the marker removed and the garment reconstructed under it, plus the shading map
     (L, white outside the marker) derived from the reconstruction, never from the marker."""
-    scene = scene.convert("RGB"); mask = marker_mask(scene)
+    scene = scene.convert("RGB"); mask, _ = isolate_marker(scene)          # the chest-marker component only; background chroma is untouched
+    if mask is None: raise CompositeError("UNUSABLE_SCENE", _)
     base = reconstruct_garment(scene, mask, tuple(placement["placeholder"]["bbox"]))
     lum = base.convert("L")
     hist = ImageChops.multiply(lum, mask.convert("L")).histogram()[1:]
@@ -163,7 +245,7 @@ def composite(scene_png_bytes, art_png_path, garment_rgb):
     scene = Image.open(io.BytesIO(scene_png_bytes)).convert("RGB")
     quad, info = find_marker_quad(scene)
     if quad is None: raise CompositeError("UNUSABLE_SCENE", info)
-    stats = ring_stats(scene, marker_mask(scene))
+    stats = ring_stats(scene, isolate_marker(scene)[0])
     if stats is None or stats["chroma_pixels_in_ring"] > 0 or stats["cv"] > RING_MAX_CV:
         why = "no garment ring around the marker" if stats is None else (f"chroma pixels in the surrounding ring ({stats['chroma_pixels_in_ring']})" if stats["chroma_pixels_in_ring"] else f"surrounding garment is not consistent enough to reconstruct believably (luminance cv {stats['cv']})")
         raise CompositeError("UNUSABLE_SCENE", f"local garment field cannot be reconstructed: {why}")
