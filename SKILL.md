@@ -334,15 +334,17 @@ The compositor (`studio/compositor.py`, Pillow only, no model call,
 1. **removes the marker, its chroma fringe and its drawn rim.** Generated
    scenes anti-alias the marker edge over 1 to 3 px; those blended pixels
    fail the strict marker colour but are visibly magenta. The removal mask
-   is the isolated component grown by at most 3 px, never a blind dilation:
+   is the isolated component grown by at most 3 px for chroma and 5 px for
+   the drawn rim, never a blind dilation:
    first one pixel per pass into 4-neighbours that a relative chroma gate
    marks as marker-tinted (both R−G and B−G above the clean garment band's
    (4 to 9 px out) mean by 6 levels or three times that band's chroma
-   spread); then, ring by ring within the same 3 px bound, a whole 1 px ring
-   is absorbed when its mean luminance deviates from the clean band by more
-   than max(0.5, 2.5%), which is the panel outline the generator draws as a
-   dark or bright line too faint for any per-pixel test; the first ring
-   that does not deviate stops it. Untinted, un-outlined garment and
+   spread); then, ring by ring within a 5 px bound of the component, a whole
+   1 px ring is absorbed when its mean luminance deviates from the clean
+   band by more than max(0.5, 2.5%), which is the panel outline and glow
+   the generator draws as a dark or bright band too faint for any per-pixel
+   test; the first ring that does not deviate stops it (the five-ring rim
+   of job `863b478926-rc1` scene 06 set the bound). Untinted, un-outlined garment and
    background pixels are never absorbed. The ring statistics and everything
    below use this mask;
 2. **reconstructs the garment under it**: the harmonic (Laplace) fill on a
@@ -355,7 +357,7 @@ The compositor (`studio/compositor.py`, Pillow only, no model call,
    ramp-blended over 2 px overlaps. A pure deterministic function of the
    scene: QA recomputes it exactly;
 3. **feathers the seam and checks continuity**: a glow the generator
-   paints around the panel decays over 6 to 12 px, beyond the 3 px bound,
+   paints around the panel decays over 6 to 12 px, beyond the rim bound,
    so inside the mask only, over the 6 px nearest its edge, the repaired
    field ramps from the local mean of the scene's 0 to 3 px outside band
    (normalised box convolution) to its own value; scene pixels outside the
@@ -694,7 +696,7 @@ for every job that ran. `human_action_required` is `null` for
 - **A faint line or soft rectangle at the panel edge after the 2026-10-02
   correction.** Two sources, diagnosed on job `863b478926-rc1`: the
   generator's drawn panel outline and glow just outside the marker (now
-  removed ring by ring within 3 px and feathered inside), and residual
+  removed ring by ring within 5 px and feathered inside), and residual
   alpha haze in the prepared derivative itself (alpha 1 to 31 over its
   whole extent), which the compositor renders faithfully and never clips:
   that is fixed by a cleaned, human-approved derivative staged through
@@ -804,7 +806,7 @@ Input: `Render the listing campaign for 1901-093.` Zero generation calls, no cam
    "medium": 4
   },
   "mode": "composited_fidelity",
-  "compositor_version": "2026-10-03.4",
+  "compositor_version": "2026-10-03.5",
   "scene_reuse": null
  },
  "authorization": {
@@ -991,7 +993,7 @@ Input: `AUTHORIZE LISTING RENDER 1901-093`, in a new run. Six scenes, six determ
    "medium": 4
   },
   "mode": "composited_fidelity",
-  "compositor_version": "2026-10-03.4",
+  "compositor_version": "2026-10-03.5",
   "scene_reuse": null
  },
  "authorization": {
@@ -1312,7 +1314,7 @@ Target `1901-093`; input `AUTHORIZE LISTING RENDER 1901-094`.
    "medium": 4
   },
   "mode": "composited_fidelity",
-  "compositor_version": "2026-10-03.4",
+  "compositor_version": "2026-10-03.5",
   "scene_reuse": null
  },
  "authorization": {
@@ -1499,7 +1501,7 @@ Scene 2 came back with no usable print area; one reroll, counted and costed.
    "medium": 4
   },
   "mode": "composited_fidelity",
-  "compositor_version": "2026-10-03.4",
+  "compositor_version": "2026-10-03.5",
   "scene_reuse": null
  },
  "authorization": {
@@ -1833,7 +1835,7 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
    "medium": 4
   },
   "mode": "composited_fidelity",
-  "compositor_version": "2026-10-03.4",
+  "compositor_version": "2026-10-03.5",
   "scene_reuse": null
  },
  "authorization": {
@@ -2092,7 +2094,7 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
    "medium": 4
   },
   "mode": "composited_fidelity",
-  "compositor_version": "2026-10-03.4",
+  "compositor_version": "2026-10-03.5",
   "scene_reuse": null
  },
  "authorization": {
@@ -2225,7 +2227,7 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
    "medium": 4
   },
   "mode": "composited_fidelity",
-  "compositor_version": "2026-10-03.4",
+  "compositor_version": "2026-10-03.5",
   "scene_reuse": null
  },
  "authorization": {
@@ -2358,7 +2360,7 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
    "medium": 4
   },
   "mode": "composited_fidelity",
-  "compositor_version": "2026-10-03.4",
+  "compositor_version": "2026-10-03.5",
   "scene_reuse": null
  },
  "authorization": {
@@ -2471,7 +2473,7 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
    "medium": 4
   },
   "mode": "composited_fidelity",
-  "compositor_version": "2026-10-03.4",
+  "compositor_version": "2026-10-03.5",
   "scene_reuse": null
  },
  "authorization": {
@@ -2584,7 +2586,7 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
    "medium": 4
   },
   "mode": "composited_fidelity",
-  "compositor_version": "2026-10-03.4",
+  "compositor_version": "2026-10-03.5",
   "scene_reuse": null
  },
  "authorization": {
@@ -2712,7 +2714,7 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
    "medium": 4
   },
   "mode": "composited_fidelity",
-  "compositor_version": "2026-10-03.4",
+  "compositor_version": "2026-10-03.5",
   "scene_reuse": null
  },
  "authorization": {
@@ -2820,7 +2822,7 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
    "medium": 4
   },
   "mode": "composited_fidelity",
-  "compositor_version": "2026-10-03.4",
+  "compositor_version": "2026-10-03.5",
   "scene_reuse": null
  },
  "authorization": {
@@ -2930,7 +2932,7 @@ The hero composite was modified after compositing (simulated re-lettering); the 
    "medium": 4
   },
   "mode": "composited_fidelity",
-  "compositor_version": "2026-10-03.4",
+  "compositor_version": "2026-10-03.5",
   "scene_reuse": null
  },
  "authorization": {
@@ -3139,7 +3141,7 @@ The reconstructed base still held marker pixels (simulated); deterministic QA re
    "medium": 4
   },
   "mode": "composited_fidelity",
-  "compositor_version": "2026-10-03.4",
+  "compositor_version": "2026-10-03.5",
   "scene_reuse": null
  },
  "authorization": {
@@ -3355,7 +3357,7 @@ The reconstructed base still held marker pixels (simulated); deterministic QA re
    "medium": 4
   },
   "mode": "composited_fidelity",
-  "compositor_version": "2026-10-03.4",
+  "compositor_version": "2026-10-03.5",
   "scene_reuse": null
  },
  "authorization": {
@@ -3513,7 +3515,7 @@ Input: `Recomposite the 1901-093 campaign with the corrected compositor.` A revi
  "supersedes": {
   "render_job_id": "origjob001",
   "folder": "/home/claude/agents/1901/shared/render-campaigns/1901-093",
-  "manifest_sha256": "52b956532cec11c94b29a3bc47892ec57ee3c109610590dad527dd554d0bb683",
+  "manifest_sha256": "c2328a8d581182396be1e708aa81dd544286931e476bbd98e80ceccd90017e16",
   "original_result": "READY_FOR_HUMAN_RENDER_REVIEW",
   "original_estimated_api_cost_usd": 0.6,
   "original_final_sha256": {
@@ -3528,8 +3530,8 @@ Input: `Recomposite the 1901-093 campaign with the corrected compositor.` A revi
  "generation_calls": 0,
  "estimated_api_cost_usd": 0.0,
  "compositor": {
-  "version": "2026-10-03.4",
-  "commit": "4600e85f76a8"
+  "version": "2026-10-03.5",
+  "commit": "4a18803ddfd1"
  },
  "timestamp": "2026-10-01T02:00:00Z",
  "campaign": {
@@ -3553,7 +3555,7 @@ Input: `Recomposite the 1901-093 campaign with the corrected compositor.` A revi
   {
    "check": "compositor_version",
    "status": "PASS",
-   "detail": "package compositor 'old' → current 2026-10-03.4 (commit 4600e85f76a8)"
+   "detail": "package compositor 'old' → current 2026-10-03.5 (commit 4a18803ddfd1)"
   },
   {
    "check": "source",
@@ -3571,7 +3573,7 @@ Input: `Recomposite the 1901-093 campaign with the corrected compositor.` A revi
    "detail": "the current run does not contain the exact command AUTHORIZE LISTING RECOMPOSITE 1901-093; nothing was changed"
   }
  ],
- "human_action_required": "Nothing changed. Job origjob001 for 1901-093 would be recomposited locally with compositor 2026-10-03.4 from its six stored base scenes and the exact source (sha256 5211ed2ff15b…), with no generation call and no spend, as job origjob001-rc1; the current package would move whole to /home/claude/agents/1901/shared/render-campaigns/_superseded/1901-093-origjob001 with 1901-093-origjob001.SUPERSEDED.json beside it, and the new package would be published at /home/claude/agents/1901/shared/render-campaigns/1901-093 for human review. To authorize exactly this, send exactly: AUTHORIZE LISTING RECOMPOSITE 1901-093"
+ "human_action_required": "Nothing changed. Job origjob001 for 1901-093 would be recomposited locally with compositor 2026-10-03.5 from its six stored base scenes and the exact source (sha256 5211ed2ff15b…), with no generation call and no spend, as job origjob001-rc1; the current package would move whole to /home/claude/agents/1901/shared/render-campaigns/_superseded/1901-093-origjob001 with 1901-093-origjob001.SUPERSEDED.json beside it, and the new package would be published at /home/claude/agents/1901/shared/render-campaigns/1901-093 for human review. To authorize exactly this, send exactly: AUTHORIZE LISTING RECOMPOSITE 1901-093"
 }
 ```
 
@@ -3588,7 +3590,7 @@ Input: `AUTHORIZE LISTING RECOMPOSITE 1901-093`. The original package moved whol
  "supersedes": {
   "render_job_id": "origjob001",
   "folder": "/home/claude/agents/1901/shared/render-campaigns/1901-093",
-  "manifest_sha256": "52b956532cec11c94b29a3bc47892ec57ee3c109610590dad527dd554d0bb683",
+  "manifest_sha256": "c2328a8d581182396be1e708aa81dd544286931e476bbd98e80ceccd90017e16",
   "original_result": "READY_FOR_HUMAN_RENDER_REVIEW",
   "original_estimated_api_cost_usd": 0.6,
   "original_final_sha256": {
@@ -3603,8 +3605,8 @@ Input: `AUTHORIZE LISTING RECOMPOSITE 1901-093`. The original package moved whol
  "generation_calls": 0,
  "estimated_api_cost_usd": 0.0,
  "compositor": {
-  "version": "2026-10-03.4",
-  "commit": "4600e85f76a8"
+  "version": "2026-10-03.5",
+  "commit": "4a18803ddfd1"
  },
  "timestamp": "2026-10-01T02:00:00Z",
  "campaign": {
@@ -3628,7 +3630,7 @@ Input: `AUTHORIZE LISTING RECOMPOSITE 1901-093`. The original package moved whol
   {
    "check": "compositor_version",
    "status": "PASS",
-   "detail": "package compositor 'old' → current 2026-10-03.4 (commit 4600e85f76a8)"
+   "detail": "package compositor 'old' → current 2026-10-03.5 (commit 4a18803ddfd1)"
   },
   {
    "check": "source",
@@ -3761,7 +3763,7 @@ Input: `Render the listing campaign for 1901-093.` with `--reuse-scenes`. The st
    "medium": 4
   },
   "mode": "composited_fidelity",
-  "compositor_version": "2026-10-03.4",
+  "compositor_version": "2026-10-03.5",
   "scene_reuse": {
    "from_render_job_id": "genjob0001",
    "base_scenes_reused": {
@@ -3773,7 +3775,7 @@ Input: `Render the listing campaign for 1901-093.` with `--reuse-scenes`. The st
     "06-detail-base.png": "e2f4ef7222f9fa9e4b17ed0d6ba7b9dd6388866f2bf073c652b339c7ecf94617"
    },
    "previous_source_sha256": "5211ed2ff15b370ae478caafe34bb2d55abb60a4fdd8f79521af2a8d416f2916",
-   "previous_compositor_version": "2026-10-03.4",
+   "previous_compositor_version": "2026-10-03.5",
    "generation_calls": 0
   }
  },
@@ -3868,7 +3870,7 @@ Input: `Render the listing campaign for 1901-093.` with `--reuse-scenes`. The st
   {
    "check": "scene_reuse",
    "status": "PASS",
-   "detail": "six base scenes of job genjob0001 verified and will be reused (mock / mock-image-1, 1024x1024); previous source 5211ed2ff15b… → 4ab3e6002aff…, compositor '2026-10-03.4' → 2026-10-03.4; no generation call"
+   "detail": "six base scenes of job genjob0001 verified and will be reused (mock / mock-image-1, 1024x1024); previous source 5211ed2ff15b… → 4ab3e6002aff…, compositor '2026-10-03.5' → 2026-10-03.5; no generation call"
   },
   {
    "check": "pricing",
@@ -3891,7 +3893,7 @@ Input: `Render the listing campaign for 1901-093.` with `--reuse-scenes`. The st
    "detail": "the current run does not contain the exact command AUTHORIZE LISTING RENDER 1901-093; ordinary requests and vague confirmations never authorize rendering"
   }
  ],
- "human_action_required": "No generation call made and no campaign files created. 1901-093 is eligible for a scene-reuse job: source 1901-093-B.png (Drive id 1WloiO2PNmvIZHQWBsYyYjqDCQOlae6Ve, sha256 4ab3e6002aff…) staged at /home/claude/agents/1901/shared/render-handoffs/1901-093/source/1901-093-B.png; product Unisex Heavy Cotton Tee / Printify Choice / Black; the six base scenes of job genjob0001 reused with compositor 2026-10-03.4, zero generation calls, zero spend; the existing package would move whole to _superseded and the new job would be published at /home/claude/agents/1901/shared/render-campaigns/1901-093. To authorize exactly this job, send exactly: AUTHORIZE LISTING RENDER 1901-093"
+ "human_action_required": "No generation call made and no campaign files created. 1901-093 is eligible for a scene-reuse job: source 1901-093-B.png (Drive id 1WloiO2PNmvIZHQWBsYyYjqDCQOlae6Ve, sha256 4ab3e6002aff…) staged at /home/claude/agents/1901/shared/render-handoffs/1901-093/source/1901-093-B.png; product Unisex Heavy Cotton Tee / Printify Choice / Black; the six base scenes of job genjob0001 reused with compositor 2026-10-03.5, zero generation calls, zero spend; the existing package would move whole to _superseded and the new job would be published at /home/claude/agents/1901/shared/render-campaigns/1901-093. To authorize exactly this job, send exactly: AUTHORIZE LISTING RENDER 1901-093"
 }
 ```
 
@@ -3961,7 +3963,7 @@ Input: `AUTHORIZE LISTING RENDER 1901-093` with `--reuse-scenes`. New job id, ne
    "medium": 4
   },
   "mode": "composited_fidelity",
-  "compositor_version": "2026-10-03.4",
+  "compositor_version": "2026-10-03.5",
   "scene_reuse": {
    "from_render_job_id": "genjob0001",
    "base_scenes_reused": {
@@ -3973,7 +3975,7 @@ Input: `AUTHORIZE LISTING RENDER 1901-093` with `--reuse-scenes`. New job id, ne
     "06-detail-base.png": "e2f4ef7222f9fa9e4b17ed0d6ba7b9dd6388866f2bf073c652b339c7ecf94617"
    },
    "previous_source_sha256": "5211ed2ff15b370ae478caafe34bb2d55abb60a4fdd8f79521af2a8d416f2916",
-   "previous_compositor_version": "2026-10-03.4",
+   "previous_compositor_version": "2026-10-03.5",
    "generation_calls": 0
   }
  },
@@ -4068,7 +4070,7 @@ Input: `AUTHORIZE LISTING RENDER 1901-093` with `--reuse-scenes`. New job id, ne
   {
    "check": "scene_reuse",
    "status": "PASS",
-   "detail": "six base scenes of job genjob0001 verified and will be reused (mock / mock-image-1, 1024x1024); previous source 5211ed2ff15b… → 4ab3e6002aff…, compositor '2026-10-03.4' → 2026-10-03.4; no generation call"
+   "detail": "six base scenes of job genjob0001 verified and will be reused (mock / mock-image-1, 1024x1024); previous source 5211ed2ff15b… → 4ab3e6002aff…, compositor '2026-10-03.5' → 2026-10-03.5; no generation call"
   },
   {
    "check": "pricing",

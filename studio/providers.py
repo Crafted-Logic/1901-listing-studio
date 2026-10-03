@@ -127,7 +127,7 @@ def draw_scene(size, color, slot, behaviour="ok", marker_pattern="uniform"):
         for y in range(int(h * 0.2), int(h * 0.9)):
             for x in range(int(w * 0.15), int(w * 0.85)):
                 if shirt_mask.getpixel((x, y)): s = (s * 1103515245 + 12345) & 0x7fffffff; dd = (s % 9) - 4; px[x, y] = tuple(max(0, min(255, v + dd)) for v in px[x, y])
-        x0, y0, x1, y1 = int(q[0] * w), int(q[1] * h), int(q[2] * w), int(q[3] * h); rings = ((1, 0.5, 0), (2, 1.0, 7), (3, 1.0, 7)) + (((4, 1.0, 7), (5, 1.0, 6)) if behaviour == "rim_wide" else ())
+        x0, y0, x1, y1 = int(q[0] * w), int(q[1] * h), int(q[2] * w), int(q[3] * h); rings = ((1, 0.5, 0), (2, 1.0, 7), (3, 1.0, 7)) + (((4, 1.0, 7), (5, 1.0, 6), (6, 1.0, 6), (7, 1.0, 5)) if behaviour == "rim_wide" else ())
         for t, k, add in rings:
             for y in range(y0 - t, y1 + t):
                 for x in range(x0 - t, x1 + t):

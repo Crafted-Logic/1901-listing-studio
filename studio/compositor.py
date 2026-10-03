@@ -26,10 +26,10 @@ RING_DARK_MEAN_MAX = 28      # luminance mean at or below which the dark branch 
 RING_DARK_MAX_STD = 9.8      # absolute spread cap = exactly what cv 0.35 allows at mean 28 (0.35*28); real evidence max 9.12
 RING_DARK_MAX_TEXTURE = 5    # mean |L - blur(L, 2)| on the ring: random mottle >= +-12 scores >= 5.4; real fabric <= 3.2
 MARKER_DOMINANCE = 4.0   # the chest marker must be at least this many times larger than any other plausible component
-COMPOSITOR_VERSION = "2026-10-03.4"   # 2026-10-02.3 + luminance-aware bounded rim removal + boundary-continuity QA
+COMPOSITOR_VERSION = "2026-10-03.5"   # 2026-10-02.3 + ring-level rim removal (5 px bound) + seam feather + boundary-continuity QA
 FRINGE_MAX_GROW_PX = 3       # the removal mask may grow at most this far beyond the marker component
 FRINGE_MARGIN_MIN = 6.0      # chroma margin (levels) over the clean band's (R-G, B-G); 3x the band's chroma std when larger
-RIM_MAX_GROW_PX = 3          # rim rings are absorbed within this bound from the component (review item: job 863b478926-rc1 scene 06 needs 5)
+RIM_MAX_GROW_PX = 5          # rim rings are absorbed within this bound from the component (approved 2026-10-03: job 863b478926-rc1 scene 06 carries a five-ring rim)
 RIM_RING_TOL_ABS = 0.5       # luminance-aware growth: a whole 1 px ring around the component (within the 3 px bound) is absorbed when its MEAN
 RIM_RING_TOL_REL = 0.025     # luminance deviates from the clean band by more than max(0.5, 2.5%): the generator's drawn panel outline is a
                              # band-level shift of 1-2 levels, below any per-pixel test against fabric texture
@@ -177,9 +177,9 @@ def chroma_gate(scene, mask_L, margin_min=FRINGE_MARGIN_MIN):
 
 
 def grow_removal_mask(scene, component_mask):
-    """Fringe- and rim-aware removal mask, never more than FRINGE_MAX_GROW_PX from the component and never a blind dilation:
+    """Fringe- and rim-aware removal mask, never a blind dilation: chroma growth within FRINGE_MAX_GROW_PX, rim growth within RIM_MAX_GROW_PX:
     (1) chroma growth: one pixel per pass, only into 4-neighbours the relative chroma gate marks as marker-tinted;
-    (2) rim growth: for each 1 px ring r = 1..3 around the component, the ring's not-yet-removed pixels are absorbed whole
+    (2) rim growth: for each 1 px ring r = 1..RIM_MAX_GROW_PX around the component, the ring's not-yet-removed pixels are absorbed whole
         when their mean luminance deviates from the clean 4-9 px band's mean by more than max(RIM_RING_TOL_ABS,
         RIM_RING_TOL_REL x band mean), the generator's drawn panel outline; the first ring that does not deviate stops it.
     Returns (mask '1', info)."""
