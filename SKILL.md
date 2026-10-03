@@ -4162,6 +4162,17 @@ touched.
 
 ## Assumptions and Limits
 
+- **Source edge matte, known limitation (stable as of 2026-10-03).** The
+  compositor renders the prepared derivative's semi-transparent edge
+  pixels exactly as drawn and never modifies source alpha or RGB. A
+  derivative whose transparency prep left a light edge matte (the approved
+  v2 of 1901-093 carries a 2 to 4 px band, mean luminance 156 against
+  content of 85) or a residual alpha haze shows a pale fringe or faint
+  rectangle over a dark garment. That is corrected only by a cleaned,
+  human-approved derivative staged through Skill #6 (proposals v3 and v4
+  for 1901-093 exist under `render-handoffs/_proposed/`, built by
+  `tools/alpha_clean.py` and `tools/defringe.py`), followed by a
+  scene-reuse job. No further edge processing is planned in this skill.
 - **Dark-garment ring rule, known limits.** On a near-black garment a
   hard-edged shadow of up to about 14 luminance levels in the ring is
   statistically indistinguishable from legitimate drape (a real crease in
