@@ -5,7 +5,7 @@ from studio import job, qa, compositor, config
 from fixtures import *
 
 examples = {}
-def run(env, ev, msg, prov, now=NOW, jid=JOB): return job.run("1901-093", ev, msg, prov, env.H, env.C, now=now, job_id=jid)
+def run(env, ev, msg, prov, now=NOW, jid=JOB, **kw): return job.run("1901-093", ev, msg, prov, env.H, env.C, now=now, job_id=jid, **kw)
 def T(n, name, out, result, rendered, env, prov, extra=None, calls=None, pre_existing=False):
     assert out["result"] == result, (n, out["result"], result, out["checks"][-1])
     assert out["render_performed"] is rendered, (n, "render_performed")
@@ -333,7 +333,7 @@ for beh, label in (("fringe", "smooth black"), ("fringe_grain", "textured black"
     before = fringe_count(sc, cL); assert before > 200, before
     e = Env(); final, pl = _c.composite(open(_scene_png(sc), "rb").read(), e.staged_path, (20, 20, 22))
     after = fringe_count(final, gL); assert after == 0, (label, after)
-    assert _c._count(gL) < _c._count(_c._dil(cL, 3)), "blind dilation"
+    assert _c._count(ImageChops.multiply(gL, ImageChops.invert(_c._dil(cL, max(_c.FRINGE_MAX_GROW_PX, _c.RIM_MAX_GROW_PX))))) == 0, "grew beyond the bound"
     print(f" F1-{beh}. PASS {label}: fringe removed by gated growth ({ginfo['grown_pixels']} px, passes {ginfo['passes']}); {before} visible fringe px before, 0 after; not a blind dilation"); e.done()
 # F2 texture restoration and continuity: textured black fabric regains high-frequency energy; smooth black stays smooth; interior mean within tolerance
 for beh, expect_tex in (("fringe_grain", True), ("fringe", False)):
@@ -424,7 +424,93 @@ o = rc(e, RC_AUTH); assert o["result"] == "SOURCE_MISMATCH" and not os.path.isdi
 # RC6 no package / missing base scene
 e = Env(); assert rc(e, RC_AUTH)["result"] == "CAMPAIGN_NOT_FOUND"; old_package(e); os.remove(os.path.join(e.C, "1901-093/generated-scenes/02-story-base.png")); assert rc(e, RC_AUTH)["result"] == "CAMPAIGN_CONFLICT"; e.done()
 print(" RC6. PASS missing package or missing base scene fails closed")
+# ---- rim removal, seam feather, boundary QA, scene reuse, alpha-clean proposal ----
+# G1 drawn panel outline on textured near-black: a 1 px dark line and 2 bright rings are absorbed ring by ring within the bound; a plain scene absorbs nothing
+sc = _pv.draw_scene("1024x1024", (20, 20, 22), 1, behaviour="rim"); comp, _ = _c.isolate_marker(sc); grown, gi = _c.grow_removal_mask(sc, comp); cL, gL = comp.convert("L"), grown.convert("L")
+assert gi["by_rim"] > 0 and gi["rim_rings"][0]["absorbed"] and gi["rim_rings"][0]["delta"] < -4 and all(r["absorbed"] for r in gi["rim_rings"][:3]) and len(gi["rim_rings"]) <= _c.RIM_MAX_GROW_PX, gi
+assert _c._count(ImageChops.multiply(gL, ImageChops.invert(_c._dil(cL, max(_c.FRINGE_MAX_GROW_PX, _c.RIM_MAX_GROW_PX))))) == 0, "grew beyond the bound"
+plain = _pv.draw_scene("1024x1024", (20, 20, 22), 1, behaviour="grain"); _, gp = _c.grow_removal_mask(plain, _c.isolate_marker(plain)[0]); assert gp["grown_pixels"] == 0 and not any(r["absorbed"] for r in gp["rim_rings"]), gp
+e = Env(); final, pl = _c.composite(open(_scene_png(sc), "rb").read(), e.staged_path, (20, 20, 22)); bd = pl["reconstruction"]["boundary"]; assert bd["ok"] and abs(bd["outer_step"]) <= bd["tolerance"] and abs(bd["seam_step"]) <= bd["tolerance"], bd; e.done()
+print(f" G1. PASS drawn panel outline absorbed ring by ring ({gi['by_rim']} px, rings {[(r['ring'], r['delta']) for r in gi['rim_rings']]}); nothing absorbed on a plain scene; boundary steps {bd['outer_step']}/{bd['seam_step']} within {bd['tolerance']}")
+# G2 a rim wider than the bound fails closed at the boundary check (the scene 06 case): UNUSABLE, no composite
+sc_w = _pv.draw_scene("1024x1024", (20, 20, 22), 1, behaviour="rim_wide"); e = Env()
+try: _c.composite(open(_scene_png(sc_w), "rb").read(), e.staged_path, (20, 20, 22)); raise AssertionError("wide rim not caught")
+except _c.CompositeError as ce: assert ce.code == "UNUSABLE_SCENE" and "boundary is not continuous" in ce.detail, ce.detail
+e.done(); print(" G2. PASS a rim wider than the bound is caught by the boundary-continuity check and fails closed")
+# G3 seam feather touches only mask pixels, within 6 px of the edge; nothing outside the mask changes
+base, shade, mask, rinfo = _c.prepare_base(sc, None); L = mask.convert("L"); assert rinfo["seam_feather"]["feathered_pixels"] > 0 and rinfo["seam_feather"]["depth_px"] == 6
+assert ImageChops.difference(Image.composite(base, Image.new("RGB", base.size), ImageChops.invert(L)), Image.composite(sc, Image.new("RGB", base.size), ImageChops.invert(L))).getbbox() is None, "pixels outside the mask changed"
+keep = _c.SEAM_FEATHER_PX; _c.SEAM_FEATHER_PX = 0
+try:
+    _c._BASE_CACHE.clear(); base0, _, _, r0 = _c.prepare_base(sc, None); d = ImageChops.difference(base, base0).convert("L"); assert _c._count(ImageChops.multiply(d.point(lambda v: 255 if v else 0), _c._ero(L, 6))) == 0, "feather changed pixels deeper than 6 px"
+finally: _c.SEAM_FEATHER_PX = keep; _c._BASE_CACHE.clear()
+print(" G3. PASS seam feather changes only mask pixels within 6 px of the edge; the scene outside is untouched")
+# G4 boundary QA fails closed on an injected seam step
+real_feather = _c.feather_seam
+def dark_edge(scene, base, mask):
+    out, info = real_feather(scene, base, mask); Lm = mask.convert("L"); band = ImageChops.subtract(Lm, _c._ero(Lm, 3)); return Image.composite(out.point(lambda v: max(0, v - 4)), out, band), info
+_c._BASE_CACHE.clear(); _c.feather_seam = dark_edge
+try:
+    _c.composite(open(_scene_png(plain), "rb").read(), Env().staged_path, (20, 20, 22)); raise AssertionError("seam step not caught")
+except _c.CompositeError as ce: assert "boundary is not continuous" in ce.detail and "seam step" in ce.detail, ce.detail
+finally: _c.feather_seam = real_feather; _c._BASE_CACHE.clear()
+print(" G4. PASS an injected 4-level seam step inside the edge fails the boundary check")
+# G5 full run with rim and fringe scenes across the six slots
+e, p = Env(), provider(script=["rim", "fringe_grain", "rim", "fringe", "grain", "rim"]); o = run(e, evidence(product_candidates=BLACK), AUTH, p)
+T("G5", "rim and fringe scenes across all six slots", o, "READY_FOR_HUMAN_RENDER_REVIEW", True, e, p, calls=6, extra=lambda o, e: all(i["checks"]["boundary_continuity"]["result"] == "PASS" and i["checks"]["no_marker_fringe"]["result"] == "PASS" for i in json.load(open(os.path.join(e.C, "1901-093/qa/qa.json")))["images"]) or sys.exit("G5"))
+# ---- scene reuse after a source change ----
+def reuse_env():
+    e, p = Env(), provider(script=["rim", "fringe_grain", "grain", "fringe", "grain", "rim"]); o = run(e, evidence(product_candidates=BLACK), AUTH, p, jid="genjob0001"); assert o["result"] == "READY_FOR_HUMAN_RENDER_REVIEW", o["checks"][-1]
+    snap_ = {f: open(os.path.join(e.C, f), "rb").read() for f in e.tree()}
+    im = Image.open(e.staged_path).convert("RGBA"); px = im.load(); px[10, 10] = (1, 2, 3, 255); im.save(e.staged_path, "PNG"); new_sha = hashlib.sha256(open(e.staged_path, "rb").read()).hexdigest()
+    hm = os.path.join(e.H, "1901-093/manifest.json"); hmj = json.load(open(hm)); hmj["source"]["sha256"] = new_sha; json.dump(hmj, open(hm, "w")); e.sha = new_sha
+    return e, snap_, new_sha
+e, snap_, new_sha = reuse_env(); o = run(e, evidence(product_candidates=BLACK), ASK, None, reuse_scenes=True)
+assert o["result"] == "AWAITING_RENDER_AUTHORIZATION" and o["render_performed"] is False and o["rendering"]["scene_reuse"]["from_render_job_id"] == "genjob0001" and o["rendering"]["scene_reuse"]["generation_calls"] == 0 and "scene-reuse job" in o["human_action_required"] and "zero spend" in o["human_action_required"], o["checks"][-1]
+assert {f: open(os.path.join(e.C, f), "rb").read() for f in e.tree()} == snap_ and not any(d.startswith(".tmp-") or d.startswith("_superseded") for d in e.dirs()); examples["RS1"] = o
+assert run(e, evidence(product_candidates=BLACK), "Proceed.", None, reuse_scenes=True)["result"] == "AWAITING_RENDER_AUTHORIZATION" and run(e, evidence(product_candidates=BLACK), "AUTHORIZE LISTING RECOMPOSITE 1901-093", None, reuse_scenes=True)["result"] == "AWAITING_RENDER_AUTHORIZATION"
+print(" RS1. PASS scene-reuse proposal with a new staged source: nothing changed, zero calls; only the render command authorizes it")
+o = run(e, evidence(product_candidates=BLACK), AUTH, None, jid="reusejob01", reuse_scenes=True); assert o["result"] == "READY_FOR_HUMAN_RENDER_REVIEW" and o["render_performed"] is True, o["checks"][-1]
+sup = os.path.join(e.C, "_superseded/1901-093-genjob0001"); rec = json.load(open(sup + ".SUPERSEDED.json")); newm = json.load(open(os.path.join(e.C, "1901-093/manifest.json")))
+assert os.path.isdir(sup) and all(open(os.path.join(sup, f[len("1901-093/"):]), "rb").read() == b for f, b in snap_.items()), "superseded package not byte-identical"
+sr = newm["scene_reuse"]; assert sr["from_render_job_id"] == "genjob0001" and sr["generation_calls"] == 0 and sr["estimated_api_cost_usd"] == 0.0 and sr["source_sha256"] == new_sha and sr["previous_source_sha256"] == json.loads(snap_["1901-093/manifest.json"])["source"]["sha256"] and len(sr["base_scenes_reused"]) == 6 and sr["compositor_version"] == _c.COMPOSITOR_VERSION and sr["superseded_manifest_sha256"] == rec["original_manifest_sha256"]
+assert newm["render_job_id"] == "reusejob01" and newm["source"]["sha256"] == new_sha and newm["rendering"]["compositor_version"] == _c.COMPOSITOR_VERSION and newm["publication_authorized"] is False and rec["superseded_by"] == "reusejob01" and rec["original_source_sha256"] == sr["previous_source_sha256"]
+for n_ in newm["generated_scenes"]: assert hashlib.sha256(open(os.path.join(e.C, "1901-093/generated-scenes", n_), "rb").read()).hexdigest() == sr["base_scenes_reused"][n_] and open(os.path.join(e.C, "1901-093/generated-scenes", n_), "rb").read() == snap_["1901-093/generated-scenes/" + n_]
+cl = json.load(open(os.path.join(e.C, "1901-093/cost-log.json"))); assert cl["images_generated"] == 0 and cl["generation_calls"] == 0 and cl["estimated_api_cost_usd"] == 0 and any("scene reuse" in n for n in cl["notes"])
+assert hashlib.sha256(open(os.path.join(e.C, "1901-093/source/1901-093-B.png"), "rb").read()).hexdigest() == new_sha and not any(d.startswith(".tmp-") for d in e.dirs()); examples["RS2"] = o
+print(" RS2. PASS authorized scene-reuse job: new job id, new source hash, six scenes byte-identical and hashed in provenance, zero calls/spend, original package superseded whole")
+assert run(e, evidence(product_candidates=BLACK), AUTH, None, reuse_scenes=True)["result"] == "ALREADY_CURRENT"; print(" RS3. PASS a second scene-reuse with the same source and compositor is ALREADY_CURRENT"); e.done()
+e, snap_, new_sha = reuse_env(); _pv.draw_scene("1024x1024", (20, 20, 22), 4, behaviour="rim_wide").save(os.path.join(e.C, "1901-093/generated-scenes/04-flatlay-base.png"), "PNG")
+snap_ = {f: open(os.path.join(e.C, f), "rb").read() for f in e.tree()}; o = run(e, evidence(product_candidates=BLACK), AUTH, None, reuse_scenes=True)
+assert o["result"] == "SCENE_REUSE_FAILED" and o["render_performed"] is False, o["checks"][-1]
+assert {f: open(os.path.join(e.C, f), "rb").read() for f in e.tree() if f.startswith("1901-093/")} == {f: b for f, b in snap_.items() if f.startswith("1901-093/")}, "original package changed"
+assert not os.path.isdir(os.path.join(e.C, "_superseded")) and not any(d.startswith(".tmp-") for d in e.dirs()) and os.path.isdir(os.path.join(e.C, "_failed/1901-093-fixture001"))
+assert json.load(open(os.path.join(e.C, "_failed/1901-093-fixture001/cost-log.json")))["generation_calls"] == 0
+print(" RS4. PASS unusable stored scene: SCENE_REUSE_FAILED, original package untouched, failed-job record kept with zero calls, no temp left"); e.done()
+e = Env(); assert run(e, evidence(product_candidates=BLACK), AUTH, None, reuse_scenes=True)["result"] == "CAMPAIGN_NOT_FOUND"; e.done()
+e, snap_, new_sha = reuse_env(); assert run(e, evidence(product_candidates=BLACK, hd=""), AUTH, None, reuse_scenes=True)["result"] == "HUMAN_APPROVAL_REQUIRED" and {f: open(os.path.join(e.C, f), "rb").read() for f in e.tree()} == snap_; e.done()
+print(" RS5. PASS no package fails closed; governance checks precede any reuse")
+# ---- alpha-clean proposal tool ----
+import importlib.util as _ilu, tempfile as _tf2, shutil as _sh2
+spec = _ilu.spec_from_file_location("alpha_clean", os.path.join(HERE, "..", "tools", "alpha_clean.py")); _ac = _ilu.module_from_spec(spec); spec.loader.exec_module(_ac)
+tdir = _tf2.mkdtemp(prefix="ac-"); src = os.path.join(tdir, "v2.png"); im = Image.new("RGBA", (200, 120), (210, 210, 212, 0)); px = im.load()
+for y in range(120):
+    for x in range(200):
+        if 40 <= x < 160 and 30 <= y < 90: px[x, y] = (180, 30, 40, 255)
+        elif 36 <= x < 164 and 26 <= y < 94: px[x, y] = (200, 100, 100, 120)
+        elif (x + y) % 7 == 0: px[x, y] = (215, 215, 218, 5 + (x % 26))
+im.save(src, "PNG"); out, lin = os.path.join(tdir, "v3.png"), os.path.join(tdir, "v3.json")
+assert _ac.main(["--source", src, "--out", out, "--lineage", lin, "--master-id", "M", "--master-name", "m.png", "--source-id", "S"]) == 0
+L_ = json.load(open(lin)); a2 = Image.open(out).convert("RGBA"); p1, p2 = im.load(), a2.load(); n_cleared = 0
+for y in range(120):
+    for x in range(200):
+        if p1[x, y][3] >= 32: assert p1[x, y] == p2[x, y]
+        elif p1[x, y][3] > 0: assert p2[x, y] == p1[x, y][:3] + (0,); n_cleared += 1
+        else: assert p1[x, y] == p2[x, y]
+assert L_["pixels"]["alpha_1_31_cleared"] == n_cleared > 0 and L_["pixels"]["alpha_255_preserved"] == 120 * 60 and L_["sha256"]["source"] != L_["sha256"]["proposed"] and L_["lineage"]["canonical_creative_master"]["drive_file_id"] == "M" and L_["lineage"]["prepared_from"]["drive_file_id"] == "S" and "PROPOSED" in L_["status"]
+assert _ac.main(["--source", src, "--out", out, "--lineage", lin, "--master-id", "M", "--master-name", "m.png", "--source-id", "S"]) == 1
+_sh2.rmtree(tdir); print(f" AC1. PASS alpha-clean: {n_cleared} haze pixels cleared to alpha 0 with RGB kept, every alpha>=32 pixel byte-identical, lineage recorded, output never overwritten")
 print("ALL PATCH TESTS PASS")
 if "--dump" in sys.argv:
-    for n in (1, 2, 4, 14, 13, 22, 23, 8, 9, 11, 18, 19, 20, "M4", "R1", "RC1", "RC2"):
+    for n in (1, 2, 4, 14, 13, 22, 23, 8, 9, 11, 18, 19, 20, "M4", "R1", "RC1", "RC2", "RS1", "RS2"):
         open(os.path.join(HERE, f"ex{n}.json"), "w").write(json.dumps(examples[n], indent=1, ensure_ascii=False) + "\n")

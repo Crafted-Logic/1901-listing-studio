@@ -11,7 +11,7 @@ perspective transform, and lit by multiplying the reconstructed garment luminanc
 art are only moved and lit; never redrawn. Every step is a pure function of (scene, art, placement)
 so QA can recompute the composite and compare pixel-for-pixel."""
 import hashlib, io, json, math
-from PIL import Image, ImageChops, ImageFilter
+from PIL import Image, ImageChops, ImageFilter, ImageMath
 
 from . import config
 
@@ -26,9 +26,18 @@ RING_DARK_MEAN_MAX = 28      # luminance mean at or below which the dark branch 
 RING_DARK_MAX_STD = 9.8      # absolute spread cap = exactly what cv 0.35 allows at mean 28 (0.35*28); real evidence max 9.12
 RING_DARK_MAX_TEXTURE = 5    # mean |L - blur(L, 2)| on the ring: random mottle >= +-12 scores >= 5.4; real fabric <= 3.2
 MARKER_DOMINANCE = 4.0   # the chest marker must be at least this many times larger than any other plausible component
-COMPOSITOR_VERSION = "2026-10-02.3"   # fringe-aware removal + converged harmonic fill + quilted texture + continuity + bounded shading
+COMPOSITOR_VERSION = "2026-10-03.4"   # 2026-10-02.3 + luminance-aware bounded rim removal + boundary-continuity QA
 FRINGE_MAX_GROW_PX = 3       # the removal mask may grow at most this far beyond the marker component
 FRINGE_MARGIN_MIN = 6.0      # chroma margin (levels) over the clean band's (R-G, B-G); 3x the band's chroma std when larger
+RIM_MAX_GROW_PX = 3          # rim rings are absorbed within this bound from the component (review item: job 863b478926-rc1 scene 06 needs 5)
+RIM_RING_TOL_ABS = 0.5       # luminance-aware growth: a whole 1 px ring around the component (within the 3 px bound) is absorbed when its MEAN
+RIM_RING_TOL_REL = 0.025     # luminance deviates from the clean band by more than max(0.5, 2.5%): the generator's drawn panel outline is a
+                             # band-level shift of 1-2 levels, below any per-pixel test against fabric texture
+SEAM_FEATHER_PX = 6          # inside the removal mask only: the repaired field ramps from the local outside edge value to its own value over this depth,
+                             # continuing a glow that the bounded rim removal cannot reach (it decays outside over ~6-12 px); scene pixels outside are never touched
+BOUNDARY_TOL_ABS = 1.0       # QA boundary continuity: adjacent-band STEPS across the seam (a line), not gradients: |0-3 px out - 3-6 px out| and
+                             # |0-3 px in (repaired) - 0-3 px out| each <= max(abs, rel * outer mean)
+BOUNDARY_TOL_REL = 0.05
 FRINGE_QA_MARGIN_MIN = 12.0  # QA counts only VISIBLY tinted pixels (twice the removal margin); removal is deliberately more aggressive than the check
 FRINGE_MAX_RATE = 0.002      # QA: marker-tinted pixels allowed in the 0-4 px band of the final, as a fraction of that band (plus the clean band's own rate)
 RELAX_MAX_ITERS = 3000       # harmonic fill: Gauss-Seidel until the largest update is below RELAX_TOL (converges in ~100-250 passes on a 56-cell grid)
@@ -168,15 +177,42 @@ def chroma_gate(scene, mask_L, margin_min=FRINGE_MARGIN_MIN):
 
 
 def grow_removal_mask(scene, component_mask):
-    """Fringe-aware removal mask: the marker component grown by at most FRINGE_MAX_GROW_PX, one pixel per pass, only into
-    4-neighbours that the relative chroma gate marks as marker-tinted. Never a blind dilation. Returns (mask '1', info)."""
-    L = component_mask.convert("L"); gate, ginfo = chroma_gate(scene, L); box = _work_box(L); cur = L.crop(box); g = gate.crop(box); added = []
+    """Fringe- and rim-aware removal mask, never more than FRINGE_MAX_GROW_PX from the component and never a blind dilation:
+    (1) chroma growth: one pixel per pass, only into 4-neighbours the relative chroma gate marks as marker-tinted;
+    (2) rim growth: for each 1 px ring r = 1..3 around the component, the ring's not-yet-removed pixels are absorbed whole
+        when their mean luminance deviates from the clean 4-9 px band's mean by more than max(RIM_RING_TOL_ABS,
+        RIM_RING_TOL_REL x band mean), the generator's drawn panel outline; the first ring that does not deviate stops it.
+    Returns (mask '1', info)."""
+    L = component_mask.convert("L"); gate_c, cinfo = chroma_gate(scene, L); box = _work_box(L); comp = L.crop(box); cur = comp; gc = gate_c.crop(box); added = []
     for _ in range(FRINGE_MAX_GROW_PX):
-        new = ImageChops.multiply(ImageChops.subtract(_dil(cur, 1), cur), g); n = _count(new); added.append(n)
+        new = ImageChops.multiply(ImageChops.subtract(_dil(cur, 1), cur), gc); n = _count(new); added.append(n)
         if n == 0: break
         cur = ImageChops.lighter(cur, new)
+    lum = scene.convert("L").crop(box); rings = []
+    for r in range(1, RIM_MAX_GROW_PX + 1):
+        band = ImageChops.subtract(_dil(cur, 9), _dil(cur, 3)); bm, _, nb = _mean_std(lum, band)
+        ring = ImageChops.multiply(ImageChops.subtract(_dil(comp, r), _dil(comp, r - 1)), ImageChops.invert(cur)); rm_, _, nr = _mean_std(lum, ring)
+        if bm is None: break
+        if rm_ is None or nr < 50: continue                                 # ring already taken by chroma growth: look at the next one
+        tol = max(RIM_RING_TOL_ABS, RIM_RING_TOL_REL * bm); dev = rm_ - bm
+        rings.append({"ring": r, "pixels": nr, "delta": round(dev, 2), "tolerance": round(tol, 2), "absorbed": abs(dev) > tol})
+        if abs(dev) <= tol: break
+        cur = ImageChops.lighter(cur, ring)
     full = Image.new("L", L.size, 0); full.paste(cur, box)
-    return full.convert("1"), {"grown_pixels": sum(added), "passes": added, "max_grow_px": FRINGE_MAX_GROW_PX, "gate": ginfo}
+    return full.convert("1"), {"grown_pixels": _count(cur) - _count(comp), "passes": added, "by_chroma": sum(added), "by_rim": sum(x["pixels"] for x in rings if x["absorbed"]), "rim_rings": rings, "max_grow_px": FRINGE_MAX_GROW_PX, "rim_max_grow_px": RIM_MAX_GROW_PX, "gate": cinfo}
+
+
+def boundary_continuity(scene, base, mask):
+    """Step continuity across the repair boundary, measured on adjacent 3 px bands so a soft lighting gradient passes and a
+    line fails: (outer step) the scene's 0-3 px band outside the mask against its 3-6 px band; (seam step) the repaired
+    base's 0-3 px band inside the mask against the scene's 0-3 px band outside. Returns (ok, info)."""
+    L = mask.convert("L"); box = _work_box(L); ml = L.crop(box); sl = scene.convert("L").crop(box); bl = base.convert("L").crop(box)
+    out03 = ImageChops.subtract(_dil(ml, 3), ml); out36 = ImageChops.subtract(_dil(ml, 6), _dil(ml, 3)); in03 = ImageChops.subtract(ml, _ero(ml, 3))
+    a, _, na = _mean_std(sl, out03); b, _, nb = _mean_std(sl, out36); i, _, ni = _mean_std(bl, in03)
+    if a is None or b is None or i is None or min(na, nb, ni) < 50:
+        return False, {"out_0_3": a, "out_3_6": b, "in_0_3": i, "tolerance": None, "detail": "bands too small to compare"}
+    tol = max(BOUNDARY_TOL_ABS, BOUNDARY_TOL_REL * b); outer_step = a - b; seam_step = i - a
+    return abs(outer_step) <= tol and abs(seam_step) <= tol, {"out_0_3": round(a, 2), "out_3_6": round(b, 2), "outer_step": round(outer_step, 2), "in_0_3": round(i, 2), "seam_step": round(seam_step, 2), "tolerance": round(tol, 2)}
 
 
 def find_marker_quad(img):
@@ -378,6 +414,31 @@ def restore_texture(scene, low, mask):
     return full, {"patches": len(acc) and (len(range(0, H, step)) * len(range(0, W, step))), "patch": P, "overlap": O, "sources": len(sources), "seed": seed}
 
 
+def feather_seam(scene, base, mask):
+    """Inward seam feather: for pixels inside the mask within SEAM_FEATHER_PX of its edge, blend the repaired value toward
+    the local mean of the scene's 0-3 px outside band (normalised box convolution, radius SEAM_FEATHER_PX), with weight
+    falling linearly from the edge inward. Pure, deterministic, touches only mask pixels. Returns (image, info)."""
+    L = mask.convert("L"); box = _work_box(L, pad=SEAM_FEATHER_PX + 12); ml = L.crop(box); sc = scene.convert("RGB").crop(box); bs = base.convert("RGB").crop(box)
+    band = ImageChops.subtract(_dil(ml, 3), ml)                                     # the outside edge band
+    inner = ImageChops.subtract(ml, _ero(ml, SEAM_FEATHER_PX))                      # the inside feather zone
+    if _count(inner) == 0 or _count(band) < 50: return base, {"feathered_pixels": 0, "depth_px": SEAM_FEATHER_PX}
+    r = SEAM_FEATHER_PX
+    wsum = band.filter(ImageFilter.BoxBlur(r))                                     # local band coverage (0..255)
+    chans = []
+    for ch in sc.split():
+        num = ImageChops.multiply(ch, band).filter(ImageFilter.BoxBlur(r))          # local band value sum / 255
+        ref = ImageMath.lambda_eval(lambda e: e["convert"](e["a"] * 255 / e["max"](e["b"], 1), "L"), a=num.convert("F"), b=wsum.convert("F"))   # normalised local edge mean
+        chans.append(ref)
+    edge_ref = Image.merge("RGB", chans)
+    # weight: 1 at the edge, 0 at depth r. Distance via successive erosions.
+    weight = Image.new("L", ml.size, 0)
+    for d in range(1, r + 1):
+        ring = ImageChops.subtract(_ero(ml, d - 1), _ero(ml, d)); weight = ImageChops.lighter(weight, ring.point(lambda v, w=int(round(255 * (1 - (d - 0.5) / r))): w if v else 0))
+    blended = Image.composite(edge_ref, bs, weight)                                # weight 255 → edge reference, 0 → repaired value
+    out = base.copy(); out.paste(Image.composite(blended, bs, inner), box)
+    return out, {"feathered_pixels": _count(inner), "depth_px": r}
+
+
 def continuity(scene, base, mask):
     """Luminance continuity of the reconstructed interior (mask eroded by 10 px) against the clean garment band 4-9 px
     outside the mask. Returns (ok, info)."""
@@ -431,9 +492,11 @@ def _prepare_base(scene):
     mask, ginfo = grow_removal_mask(scene, comp)
     low = reconstruct_garment(scene, mask, mask.convert("L").getbbox())
     base, tinfo = restore_texture(scene, low, mask)
+    base, finfo = feather_seam(scene, base, mask)
     ok, cinfo = continuity(scene, base, mask)
+    bok, binfo = boundary_continuity(scene, base, mask)
     shade, sinfo = shading_map(low, mask)
-    return base, shade, mask, {"removal": ginfo, "texture": tinfo, "continuity": {"ok": ok, **cinfo}, "shading": sinfo}
+    return base, shade, mask, {"removal": ginfo, "texture": tinfo, "seam_feather": finfo, "continuity": {"ok": ok, **cinfo}, "boundary": {"ok": bok, **binfo}, "shading": sinfo}
 
 
 def composite(scene_png_bytes, art_png_path, garment_rgb):
@@ -458,6 +521,8 @@ def composite(scene_png_bytes, art_png_path, garment_rgb):
     base, shade, removal, rinfo = prepare_base(scene, placement)
     if not rinfo["continuity"]["ok"]:
         raise CompositeError("UNUSABLE_SCENE", f"reconstructed garment is not continuous with its surroundings (interior {rinfo['continuity']['interior_mean']} vs band {rinfo['continuity']['band_mean']}, tolerance {rinfo['continuity']['tolerance']})")
+    if not rinfo["boundary"]["ok"]:
+        b = rinfo["boundary"]; raise CompositeError("UNUSABLE_SCENE", f"repair boundary is not continuous (outer step {b.get('outer_step')}, seam step {b.get('seam_step')}, tolerance {b.get('tolerance')})")
     placement["reconstruction"] = rinfo
     return _render(base, shade, art, placement), placement
 

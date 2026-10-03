@@ -39,10 +39,14 @@ def main(argv=None):
         if name == "run":
             s.add_argument("--design-id", required=True); s.add_argument("--evidence", required=True); s.add_argument("--message", default="")
             s.add_argument("--handoff-root", default=config.HANDOFF_ROOT); s.add_argument("--campaign-root", default=config.CAMPAIGN_ROOT)
+            s.add_argument("--reuse-scenes", action="store_true", help="new governed job reusing the existing package's six base scenes: no provider, no generation call, no spend")
     r = sub.add_parser("recomposite"); r.add_argument("--design-id", required=True); r.add_argument("--message", default=""); r.add_argument("--handoff-root", default=config.HANDOFF_ROOT); r.add_argument("--campaign-root", default=config.CAMPAIGN_ROOT)
     a = p.parse_args(argv)
     if a.cmd == "recomposite":
         print(json.dumps(job.recomposite(a.design_id, a.message, handoff_root=a.handoff_root, campaign_root=a.campaign_root), indent=1, ensure_ascii=False)); return 0
+    if a.cmd == "run" and a.reuse_scenes:
+        evidence = json.load(open(a.evidence, encoding="utf-8"))
+        print(json.dumps(job.run(a.design_id, evidence, a.message, None, handoff_root=a.handoff_root, campaign_root=a.campaign_root, reuse_scenes=True), indent=1, ensure_ascii=False)); return 0
     prov, problem = build_provider(a)
     if a.cmd == "preflight":
         print(json.dumps(problem if problem else prov.preflight(), indent=1, ensure_ascii=False)); return 0

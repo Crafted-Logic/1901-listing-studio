@@ -31,6 +31,8 @@ def check_image(slot, role, base_png_path, final_png_path, art_path, placement, 
     c("no_marker_fringe", tinted04 <= allowed, f"{tinted04} marker-tinted pixels in the 0-4 px band outside the repaired region (allowed {allowed}: clean-band rate {base_rate:.2%} + {compositor.FRINGE_MAX_RATE:.1%} of {n04} px; gate margin {ginfo['margin']} over R-G {ginfo['reference_rg']}, B-G {ginfo['reference_bg']})")
     cont = rinfo["continuity"]
     c("reconstruction_continuity", cont["ok"] is True, f"interior {cont.get('interior_mean')} vs clean 4-9 px band {cont.get('band_mean')}: delta {cont.get('delta')} within {cont.get('tolerance')}" if cont.get("delta") is not None else cont.get("detail", "not comparable"))
+    bd = rinfo["boundary"]
+    c("boundary_continuity", bd["ok"] is True, f"steps across the repair seam: 0-3 px outside {bd.get('out_0_3')} vs 3-6 px outside {bd.get('out_3_6')} (outer step {bd.get('outer_step')}); repaired 0-3 px inside {bd.get('in_0_3')} (seam step {bd.get('seam_step')}); tolerance {bd.get('tolerance')}" if bd.get("tolerance") is not None else bd.get("detail", "not comparable"))
     c("garment_texture_restored", rinfo["texture"].get("patches", 0) > 0, f"{rinfo['texture'].get('patches', 0)} quilted ring-texture patches ({rinfo['texture'].get('sources', 0)} source positions)")
     sh = rinfo["shading"]; c("bounded_shading", sh["min_modulation"] + 1e-9 >= sh["floor_effective"] and sh["median_modulation"] <= 1.0, f"print modulated by the low-frequency garment field only: median {sh['median_modulation']}, min {sh['min_modulation']} (floor {sh['floor']})")
     alpha = compositor.warped_alpha(scene.size, art, placement)

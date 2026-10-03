@@ -62,7 +62,7 @@ class Provider:
 
 class MockProvider(Provider):
     """Draws a synthetic garment scene with real shading and a UNIFORM chroma marker (the marker carries
-    no shading information). `script` lists per-call behaviours: "ok", "no_marker", "tiny", "edge", "purple_bg", "hollow", "fragmented", "grain", "mottled", "hard_shadow", "stripes", "fringe", "fringe_grain"
+    no shading information). `script` lists per-call behaviours: "ok", "no_marker", "tiny", "edge", "purple_bg", "hollow", "fragmented", "grain", "mottled", "hard_shadow", "stripes", "fringe", "fringe_grain", "rim", "rim_wide"
     (marker straddling the shirt edge: ring inconsistent), "error". Beyond the script: "ok".
     marker_pattern "uniform" | "noisy" controls the marker's own pixel values (for the test proving
     shading does not depend on them)."""
@@ -122,6 +122,18 @@ def draw_scene(size, color, slot, behaviour="ok", marker_pattern="uniform"):
                     px[x, y] = tuple(min(255, v + 40) for v in (r, g, b))
         d = ImageDraw.Draw(img); behaviour = "ok"
     if behaviour == "edge": q = (0.55, 0.38, 0.95, 0.66)                 # straddles the sleeve edge and the background
+    if behaviour in ("rim", "rim_wide"):                               # generator-like drawn panel outline: a 1 px dark line then bright rings (achromatic), on grainy fabric
+        px = img.load(); s = 11
+        for y in range(int(h * 0.2), int(h * 0.9)):
+            for x in range(int(w * 0.15), int(w * 0.85)):
+                if shirt_mask.getpixel((x, y)): s = (s * 1103515245 + 12345) & 0x7fffffff; dd = (s % 9) - 4; px[x, y] = tuple(max(0, min(255, v + dd)) for v in px[x, y])
+        x0, y0, x1, y1 = int(q[0] * w), int(q[1] * h), int(q[2] * w), int(q[3] * h); rings = ((1, 0.5, 0), (2, 1.0, 7), (3, 1.0, 7)) + (((4, 1.0, 7), (5, 1.0, 6)) if behaviour == "rim_wide" else ())
+        for t, k, add in rings:
+            for y in range(y0 - t, y1 + t):
+                for x in range(x0 - t, x1 + t):
+                    if x0 - t + 1 <= x < x1 + t - 1 and y0 - t + 1 <= y < y1 + t - 1: continue
+                    if 0 <= x < w and 0 <= y < h: px[x, y] = tuple(max(0, min(255, int(v * k) + add)) for v in px[x, y])
+        d = ImageDraw.Draw(img); d.rectangle([x0, y0, x1 - 1, y1 - 1], fill=config.PLACEHOLDER_RGB); behaviour = "ok"
     if behaviour in ("fringe", "fringe_grain"):                       # generator-like anti-aliased marker edge: 3 px blended into the garment
         if behaviour == "fringe_grain":
             px = img.load(); s = 11

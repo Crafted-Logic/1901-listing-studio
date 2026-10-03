@@ -291,7 +291,47 @@ def inspect_existing(campaign_root, design_id, source_sha, product):
     return "ALREADY_RENDERED", "existing campaign has the same design, source hash, product specification and schema, a complete six-image package and QA PASS", m
 
 
-def run(design_id, evidence, message, provider, handoff_root=config.HANDOFF_ROOT, campaign_root=config.CAMPAIGN_ROOT, now=None, job_id=None):
+def verify_package_for_reuse(campaign_root, design_id):
+    """The existing reviewed package whose six base scenes a new job may reuse. Returns (info, problem)."""
+    folder = os.path.join(campaign_root, design_id); mpath = os.path.join(folder, "manifest.json")
+    if not os.path.isfile(mpath): return None, f"no reviewed campaign package at {folder} to reuse scenes from"
+    try: m = json.load(open(mpath, encoding="utf-8"))
+    except Exception as e: return None, f"manifest unreadable ({e.__class__.__name__})"  # noqa: BLE001
+    scenes = m.get("generated_scenes") or []; missing = [n for n in scenes if not os.path.isfile(os.path.join(folder, "generated-scenes", n))]
+    bad = [n for n, h in (m.get("final_sha256") or {}).items() if not os.path.isfile(os.path.join(folder, "final-composites", n)) or sha256_bytes(open(os.path.join(folder, "final-composites", n), "rb").read()) != h]
+    if m.get("design_id") != design_id or m.get("result") != "READY_FOR_HUMAN_RENDER_REVIEW" or len(scenes) != 6 or missing or bad or len(m.get("scene_slots") or []) != 6:
+        return None, f"package does not verify: result {m.get('result')!r}, scenes {len(scenes)}, missing {missing}, hash mismatches {bad}"
+    return {"render_job_id": m.get("render_job_id"), "folder": folder, "manifest": m, "manifest_sha256": sha256_bytes(open(mpath, "rb").read()),
+            "base_scenes": {n: sha256_bytes(open(os.path.join(folder, "generated-scenes", n), "rb").read()) for n in scenes}}, None
+
+
+def supersede_and_publish(campaign_root, design_id, folder, tmp, old_manifest, old_manifest_sha, new_job_id, now, reason):
+    """Move the existing package whole to _superseded/<design>-<job>/ (one rename), write the SUPERSEDED record beside it,
+    then rename the new package into place. On failure the original is put back. Returns (ok, detail, sup_folder, sup_record)."""
+    sup_root = os.path.join(campaign_root, "_superseded"); orig = old_manifest.get("render_job_id", ""); sup_folder = os.path.join(sup_root, f"{design_id}-{orig}"); sup_record = sup_folder + ".SUPERSEDED.json"
+    if os.path.exists(sup_folder) or os.path.exists(sup_record): return False, f"{sup_folder} already exists", sup_folder, sup_record
+    os.makedirs(sup_root, exist_ok=True)
+    if sha256_bytes(open(os.path.join(folder, "manifest.json"), "rb").read()) != old_manifest_sha: return False, "the existing manifest changed during the job", sup_folder, sup_record
+    os.rename(folder, sup_folder)
+    try:
+        json.dump({"design_id": design_id, "render_job_id": orig, "superseded_by": new_job_id, "superseded_at": now, "reason": reason, "original_result": old_manifest.get("result"), "original_manifest_sha256": old_manifest_sha, "original_final_sha256": old_manifest.get("final_sha256"), "original_estimated_api_cost_usd": old_manifest.get("estimated_api_cost_usd"), "original_source_sha256": (old_manifest.get("source") or {}).get("sha256"), "folder": os.path.relpath(sup_folder, campaign_root), "preserved": "whole package moved by rename; no file inside it was modified"}, open(sup_record, "w", encoding="utf-8"), indent=2)
+        os.rename(tmp, folder)
+    except Exception as e:  # noqa: BLE001
+        try:
+            if os.path.isfile(sup_record): os.remove(sup_record)
+            if not os.path.exists(folder): os.rename(sup_folder, folder)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        return False, f"publish failed ({e.__class__.__name__}: {e}); the original package was restored", sup_folder, sup_record
+    if sha256_bytes(open(os.path.join(sup_folder, "manifest.json"), "rb").read()) != old_manifest_sha: return False, "superseded manifest hash changed after the move", sup_folder, sup_record
+    return True, "", sup_folder, sup_record
+
+
+def run(design_id, evidence, message, provider, handoff_root=config.HANDOFF_ROOT, campaign_root=config.CAMPAIGN_ROOT, now=None, job_id=None, reuse_scenes=False):
+    """reuse_scenes=True: a new governed job that reuses the six stored base scenes of the existing reviewed package for
+    this design instead of generating (zero generation calls, zero spend), e.g. after the approved source changed or the
+    compositor was corrected. Every governance check runs as usual; provider checks, pricing and budget are not needed
+    (provider may be None); the existing package is superseded whole, never overwritten."""
     now = now or now_iso()
     out = {"design_id": "", "result": "", "render_performed": False, "render_job_id": "", "timestamp": now,
            "source": {"drive_file_id": "", "filename": "", "sha256": "", "staged_path": ""},
@@ -299,7 +339,7 @@ def run(design_id, evidence, message, provider, handoff_root=config.HANDOFF_ROOT
            "campaign": {"root": campaign_root, "design_folder": "", "manifest_path": "", "qa_path": "", "contact_sheet_path": "", "images": []},
            "budget": {"per_listing_limit_usd": config.PER_LISTING_LIMIT_USD, "monthly_limit_usd": config.MONTHLY_LIMIT_USD, "estimated_job_cost_usd": 0, "monthly_recorded_cost_usd": 0, "projected_monthly_cost_usd": 0, "budget_flag": ""},
            "verification": {"queue_verified": False, "human_approval_verified": False, "source_verified": False, "handoff_verified": False, "product_spec_verified": False, "pricing_verified": False, "budget_verified": False, "qa_passed": False, "campaign_verified": False},
-           "rendering": {"provider": provider.name, "model": provider.model, "size": provider.size, "quality_mix": config.QUALITY_MIX, "mode": "composited_fidelity"},
+           "rendering": {"provider": provider.name if provider else None, "model": provider.model if provider else None, "size": provider.size if provider else None, "quality_mix": config.QUALITY_MIX, "mode": "composited_fidelity", "compositor_version": compositor.COMPOSITOR_VERSION, "scene_reuse": None},
            "authorization": {"received": False, "evidence": ""}, "prior_failed_jobs": [], "proposed_expense_log_row": {}, "warnings": [], "checks": [], "human_action_required": None}
     checks, warnings, ver = out["checks"], out["warnings"], out["verification"]
     def chk(name, status, detail): checks.append({"check": name, "status": status, "detail": detail})
@@ -416,23 +456,40 @@ def run(design_id, evidence, message, provider, handoff_root=config.HANDOFF_ROOT
     ver["product_spec_verified"] = True; chk("product_spec", "PASS", f"{product['blank']} / {product['provider']} / {product['color']} from {product['spec_source']}")
 
     # 7 provider: credentials, configured model, quality tiers, size, pricing (all read-only; no generation call)
-    size = provider.size
-    if not provider.credentials_available():
+    reuse = None
+    if reuse_scenes:
+        reuse, problem = verify_package_for_reuse(campaign_root, did)
+        if reuse is None:
+            chk("scene_reuse", "FAIL", problem); return done("CAMPAIGN_NOT_FOUND" if "no reviewed campaign" in problem else "CAMPAIGN_CONFLICT", f"Scenes cannot be reused for {did}: {problem}. Nothing was changed.")
+        old = reuse["manifest"]; old_src = (old.get("source") or {}).get("sha256"); old_cv = (old.get("rendering") or {}).get("compositor_version")
+        if old_src == info["sha256"] and old_cv == compositor.COMPOSITOR_VERSION:
+            chk("scene_reuse", "FAIL", f"the existing package (job {reuse['render_job_id']}) already uses source {info['sha256'][:12]}… and compositor {compositor.COMPOSITOR_VERSION}"); return done("ALREADY_CURRENT", f"The campaign for {did} already has this source and compositor; nothing to redo.")
+        size = (old.get("rendering") or {}).get("size", config.IMAGE_SIZE); model = (old.get("rendering") or {}).get("model"); pname = (old.get("rendering") or {}).get("provider")
+        out["rendering"].update(provider=pname, model=model, size=size, scene_reuse={"from_render_job_id": reuse["render_job_id"], "base_scenes_reused": reuse["base_scenes"], "previous_source_sha256": old_src, "previous_compositor_version": old_cv, "generation_calls": 0})
+        chk("scene_reuse", "PASS", f"six base scenes of job {reuse['render_job_id']} verified and will be reused ({pname} / {model}, {size}); previous source {str(old_src)[:12]}… → {info['sha256'][:12]}…, compositor {old_cv!r} → {compositor.COMPOSITOR_VERSION}; no generation call")
+        snap = (old.get("rendering") or {}).get("pricing_snapshot"); prices = {qlt: 0.0 for qlt in config.QUALITY_MIX}
+        plan = [{"slot": s_, "key": k, "role": role, "quality": qlt, "size": size, "model": model, "estimated_cost_usd": 0.0} for s_, k, role, qlt in config.SLOTS]; estimate = 0.0
+        ver["pricing_verified"] = True; chk("pricing", "PASS", "scene reuse: no generation call, no per-image cost")
+    else:
+      size = provider.size
+    if not reuse_scenes and not provider.credentials_available():
         chk("model_quality", "FAIL", f"no credentials are available in the runtime environment for provider {provider.name}"); return done("MODEL_OR_QUALITY_BLOCK", f"No image-provider credential is available to Walter for {provider.name}. Providing one is a credential decision for Jody; nothing was assumed and nothing was called.")
-    avail = provider.model_available()
-    if avail is False:
+    avail = provider.model_available() if not reuse_scenes else None
+    if not reuse_scenes and avail is False:
         chk("model_quality", "FAIL", f"configured model '{provider.model}' is not available to these credentials"); return done("MODEL_OR_QUALITY_BLOCK", f"The configured image model {provider.model} is not available on {provider.name}. Configure an available model; no substitute was chosen.")
-    missing = [qlt for qlt in config.QUALITY_MIX if not provider.supports_quality(qlt)]
-    if missing or not provider.supports_size(size):
+    missing = [qlt for qlt in config.QUALITY_MIX if not provider.supports_quality(qlt)] if not reuse_scenes else []
+    if not reuse_scenes and (missing or not provider.supports_size(size)):
         chk("model_quality", "FAIL", f"configured model '{provider.model}' capability record lacks " + (", ".join(f"quality '{q}'" for q in missing) if missing else f"size {size}")); return done("MODEL_OR_QUALITY_BLOCK", f"The configured model {provider.model} on {provider.name} is not recorded as supporting the governed quality mix (2 high, 4 medium) at {size}. A substitute model or tier needs explicit human authorization; none was assumed.")
-    chk("model_quality", "PASS", f"{provider.name} / {provider.model}: credentials present, model {'verified available' if avail else 'availability not checked offline'}, high and medium at {size} per the configured capability record")
-    snap = provider.pricing_snapshot()
-    prices = {qlt: (pricing.cost_of(snap, qlt, size) if snap else None) for qlt in config.QUALITY_MIX}
-    if snap is None or any(v is None for v in prices.values()):
+    if not reuse_scenes: chk("model_quality", "PASS", f"{provider.name} / {provider.model}: credentials present, model {'verified available' if avail else 'availability not checked offline'}, high and medium at {size} per the configured capability record")
+    if not reuse_scenes:
+        snap = provider.pricing_snapshot()
+        prices = {qlt: (pricing.cost_of(snap, qlt, size) if snap else None) for qlt in config.QUALITY_MIX}
+    if not reuse_scenes and (snap is None or any(v is None for v in prices.values())):
         chk("pricing", "FAIL", f"no usable pricing snapshot for exactly {provider.name} / {provider.model} / {size} with both quality tiers before spend"); return done("PRICING_UNAVAILABLE", f"Record a current pricing snapshot for exactly {provider.name} / {provider.model} / {size} (provider, model, size, captured_at, basis, currency, per_image_usd by quality). A snapshot for another model is invalid; no per-image cost was guessed.")
-    ver["pricing_verified"] = True; chk("pricing", "PASS", f"{snap['provider']} / {snap['model']} / {snap['size']} captured {snap['captured_at']}: high ${prices['high']:.4f}, medium ${prices['medium']:.4f} per image ({snap['basis']})")
-    plan = [{"slot": s, "key": k, "role": role, "quality": qlt, "size": size, "model": provider.model, "estimated_cost_usd": prices[qlt]} for s, k, role, qlt in config.SLOTS]
-    estimate = round(sum(p["estimated_cost_usd"] for p in plan), 6)
+    if not reuse_scenes:
+        ver["pricing_verified"] = True; chk("pricing", "PASS", f"{snap['provider']} / {snap['model']} / {snap['size']} captured {snap['captured_at']}: high ${prices['high']:.4f}, medium ${prices['medium']:.4f} per image ({snap['basis']})")
+        plan = [{"slot": s, "key": k, "role": role, "quality": qlt, "size": size, "model": provider.model, "estimated_cost_usd": prices[qlt]} for s, k, role, qlt in config.SLOTS]
+        estimate = round(sum(p["estimated_cost_usd"] for p in plan), 6)
 
     # 8 budget
     mr = evidence.get("monthly_recorded_usd")
@@ -455,13 +512,14 @@ def run(design_id, evidence, message, provider, handoff_root=config.HANDOFF_ROOT
     # 9 existing campaign
     folder = os.path.join(campaign_root, did)
     out["campaign"].update(design_folder=folder, manifest_path=os.path.join(folder, "manifest.json"), qa_path=os.path.join(folder, "qa", "qa.json"), contact_sheet_path=os.path.join(folder, "qa", "contact-sheet.png"))
-    ex, exdetail, exm = inspect_existing(campaign_root, did, info["sha256"], product)
+    ex, exdetail, exm = inspect_existing(campaign_root, did, info["sha256"], product) if not reuse_scenes else (None, "", None)
+    if reuse_scenes: chk("existing_campaign", "INFO", f"existing package (job {reuse['render_job_id']}) will be superseded whole by this job; nothing is overwritten")
     if ex == "CAMPAIGN_CONFLICT":
         chk("existing_campaign", "FAIL", exdetail); return done("CAMPAIGN_CONFLICT", f"A campaign folder for {did} already exists and does not match ({exdetail}); a human must review {folder}. Nothing was overwritten or regenerated.")
     if ex == "ALREADY_RENDERED":
         out["render_job_id"] = exm.get("render_job_id", ""); out["campaign"]["images"] = exm.get("final_composites", []); ver.update(qa_passed=True, campaign_verified=True)
         chk("existing_campaign", "PASS", exdetail); return done("ALREADY_RENDERED", None)
-    chk("existing_campaign", "PASS", "no campaign folder exists for this design")
+    if not reuse_scenes: chk("existing_campaign", "PASS", "no campaign folder exists for this design")
 
     # 9b prior failed jobs of this design (read-only): their spend already counts in the monthly floor above; their
     # rerolls never carry into a new job. A human-recorded validator-defect ruling marks a job whose rerolls were
@@ -476,7 +534,7 @@ def run(design_id, evidence, message, provider, handoff_root=config.HANDOFF_ROOT
     if prior:
         chk("prior_failed_jobs", "INFO", "; ".join(f"{pj['render_job_id']}: {pj['result']}, {pj['rerolls']} reroll(s), ${float(pj['estimated_api_cost_usd'] or 0):.4f}, attribution {pj['attribution']}" + (f" (corrected in {pj['validator_defect']['corrected_in']})" if pj["validator_defect"] else "") for pj in prior) + "; artifacts preserved under _failed; a new job needs its own exact authorization")
 
-    row_base = {"design_id": did, "model": f"{provider.name}/{provider.model}", "size": size, "quality_mix": config.QUALITY_MIX, "source_drive_id": info["drive_file_id"], "source_sha256": info["sha256"], "pricing_snapshot": snap, "campaign_folder": folder}
+    row_base = {"design_id": did, "model": f"{out['rendering']['provider']}/{out['rendering']['model']}", "size": size, "quality_mix": config.QUALITY_MIX, "source_drive_id": info["drive_file_id"], "source_sha256": info["sha256"], "pricing_snapshot": snap, "campaign_folder": folder}
 
     # 10 authorization
     if not (auth and auth[0] == "OK"):
@@ -484,6 +542,8 @@ def run(design_id, evidence, message, provider, handoff_root=config.HANDOFF_ROOT
         else: chk("authorization", "FAIL", f"the current run does not contain the exact command AUTHORIZE LISTING RENDER {did}; ordinary requests and vague confirmations never authorize rendering")
         out["proposed_expense_log_row"] = {**row_base, "render_job_id": "", "started_at": "", "completed_at": "", "images_generated": 0, "rerolls": 0, "usage_record": [], "estimated_api_cost_usd": estimate, "job_status": "PROPOSED", "budget_flag": "OK", "notes": ["proposal only; no generation call made"] + retry_notes, "actual_billed_cost_usd": None}
         out["campaign"]["images"] = [f"{p['slot']:02d}-{p['key']}.png" for p in plan]
+        if reuse_scenes:
+            return done("AWAITING_RENDER_AUTHORIZATION", f"No generation call made and no campaign files created. {did} is eligible for a scene-reuse job: source {info['filename']} (Drive id {info['drive_file_id']}, sha256 {info['sha256'][:12]}…) staged at {info['staged_path']}; product {product['blank']} / {product['provider']} / {product['color']}; the six base scenes of job {reuse['render_job_id']} reused with compositor {compositor.COMPOSITOR_VERSION}, zero generation calls, zero spend; the existing package would move whole to _superseded and the new job would be published at {folder}. To authorize exactly this job, send exactly: AUTHORIZE LISTING RENDER {did}")
         return done("AWAITING_RENDER_AUTHORIZATION", f"No generation call made and no campaign files created. {did} is eligible: source {info['filename']} (Drive id {info['drive_file_id']}, sha256 {info['sha256'][:12]}…) staged at {info['staged_path']}; product {product['blank']} / {product['provider']} / {product['color']}; six scenes (2 high, 4 medium) at {size} on {provider.name} / {provider.model} at an estimated ${estimate:.4f}, month ${monthly:.4f} → ${whole['projected_monthly']:.4f}; output {folder}. To authorize exactly this render job, send exactly: AUTHORIZE LISTING RENDER {did}")
     out["authorization"].update(received=True, evidence=auth[1]); chk("authorization", "PASS", f"current run contains the exact command: {auth[1]}")
 
@@ -494,12 +554,12 @@ def run(design_id, evidence, message, provider, handoff_root=config.HANDOFF_ROOT
     for sub in ("source", "generated-scenes", "final-composites", "qa"):
         os.makedirs(os.path.join(tmp, sub), exist_ok=False)
     started = now
-    cost = {"render_job_id": job_id, "design_id": did, "started_at": started, "completed_at": "", "model": row_base["model"], "size": size, "quality_mix": config.QUALITY_MIX, "images_generated": 0, "rerolls": 0,
-            "source_drive_id": info["drive_file_id"], "source_sha256": info["sha256"], "usage_record": [], "pricing_snapshot": snap, "estimated_api_cost_usd": 0, "campaign_folder": folder, "job_status": "RUNNING", "budget_flag": "OK", "notes": list(retry_notes), "actual_billed_cost_usd": None}
+    cost = {"render_job_id": job_id, "design_id": did, "started_at": started, "completed_at": "", "model": row_base["model"], "size": size, "quality_mix": config.QUALITY_MIX, "images_generated": 0, "generation_calls": 0, "rerolls": 0,
+            "source_drive_id": info["drive_file_id"], "source_sha256": info["sha256"], "usage_record": [], "pricing_snapshot": snap, "estimated_api_cost_usd": 0, "campaign_folder": folder, "job_status": "RUNNING", "budget_flag": "OK", "notes": list(retry_notes) + ([f"scene reuse from job {reuse['render_job_id']}: no generation call; no spend"] if reuse_scenes else []), "actual_billed_cost_usd": None}
     images, scene_prompts = [], {}
 
     def write_cost(status, flag="OK"):
-        cost.update(images_generated=len(guard.usage), rerolls=guard.rerolls, usage_record=guard.usage, estimated_api_cost_usd=guard.job_cost, job_status=status, budget_flag=flag, completed_at=now_iso() if now is None else now)
+        cost.update(images_generated=len(guard.usage), generation_calls=len(guard.usage), rerolls=guard.rerolls, usage_record=guard.usage, estimated_api_cost_usd=guard.job_cost, job_status=status, budget_flag=flag, completed_at=now_iso() if now is None else now)
         json.dump(cost, open(os.path.join(tmp, "cost-log.json"), "w", encoding="utf-8"), indent=2)
         out["budget"].update(estimated_job_cost_usd=guard.job_cost, projected_monthly_cost_usd=round(monthly + guard.job_cost, 6), budget_flag=flag)
         out["proposed_expense_log_row"] = {**row_base, **{k: cost[k] for k in ("render_job_id", "started_at", "completed_at", "images_generated", "rerolls", "usage_record", "estimated_api_cost_usd", "job_status", "budget_flag", "notes", "actual_billed_cost_usd")}}
@@ -536,18 +596,26 @@ def run(design_id, evidence, message, provider, handoff_root=config.HANDOFF_ROOT
             if not b["ok"]:
                 flag = "STOPPED"; chk("budget", "FAIL", f"before scene {slot}{' reroll' if is_reroll else ''}: {b['reason']}; call not made")
                 return fail("STOPPED_BUDGET", f"Rendering {did} stopped before scene {slot}: {b['reason']}. {len(guard.usage)} image(s) generated so far; no further spend. A new AUTHORIZE LISTING RENDER {did} command is required after Jody decides on the budget.", "STOPPED")
-            try:
-                g = provider.generate_scene(prompt, qlt, size, {"design_id": did, "slot": slot, "role": role, "garment_rgb": product["garment_rgb"], "render_job_id": job_id, "reroll": is_reroll})
-            except Exception as e:  # noqa: BLE001
-                chk(f"scene_{slot}", "FAIL", f"generation call failed ({e.__class__.__name__}: {e})"); return fail("GENERATION_FAILED", f"The image provider failed on scene {slot} for {did}. Check the provider, then re-run with a fresh AUTHORIZE LISTING RENDER {did}.")
-            guard.record(prices[qlt], g["usage"], slot, g["quality"], g["size"], reroll=is_reroll, reason=reroll_reason, model=g.get("model"))
-            if g.get("quality") != qlt or g.get("model") != provider.model or g.get("size") != size:
+            if reuse_scenes:
+                src_name = f"{slot:02d}-{key}-base.png"; src_path = os.path.join(reuse["folder"], "generated-scenes", src_name); old_slot = next((x for x in reuse["manifest"]["scene_slots"] if x["slot"] == slot), {})
+                g = {"png": open(src_path, "rb").read(), "usage": {}, "quality": old_slot.get("quality", qlt), "size": size, "model": old_slot.get("model")}
+                if sha256_bytes(g["png"]) != reuse["base_scenes"].get(src_name): chk(f"scene_{slot}", "FAIL", "stored base scene changed since verification"); return fail("VERIFICATION_FAILED", f"The stored base scene for slot {slot} changed while the job ran; nothing published.")
+                qlt = g["quality"]
+            else:
+                try:
+                    g = provider.generate_scene(prompt, qlt, size, {"design_id": did, "slot": slot, "role": role, "garment_rgb": product["garment_rgb"], "render_job_id": job_id, "reroll": is_reroll})
+                except Exception as e:  # noqa: BLE001
+                    chk(f"scene_{slot}", "FAIL", f"generation call failed ({e.__class__.__name__}: {e})"); return fail("GENERATION_FAILED", f"The image provider failed on scene {slot} for {did}. Check the provider, then re-run with a fresh AUTHORIZE LISTING RENDER {did}.")
+                guard.record(prices[qlt], g["usage"], slot, g["quality"], g["size"], reroll=is_reroll, reason=reroll_reason, model=g.get("model"))
+            if not reuse_scenes and (g.get("quality") != qlt or g.get("model") != provider.model or g.get("size") != size):
                 chk(f"scene_{slot}", "FAIL", f"provider returned model '{g.get('model')}' quality '{g.get('quality')}' size '{g.get('size')}' instead of '{provider.model}' '{qlt}' '{size}'"); return fail("MODEL_OR_QUALITY_BLOCK", f"The provider substituted a different model, quality tier or size on scene {slot}; a substitute needs explicit human authorization.")
             base_name = f"{slot:02d}-{key}-base.png"; final_name = f"{slot:02d}-{key}.png"
             base_path = os.path.join(tmp, "generated-scenes", base_name); open(base_path, "wb").write(g["png"])
             try:
                 final_img, placement = compositor.composite(g["png"], art_path, product["garment_rgb"])
             except compositor.CompositeError as ce:
+                if ce.code == "UNUSABLE_SCENE" and reuse_scenes:
+                    chk(f"scene_{slot}", "FAIL", f"stored scene unusable under compositor {compositor.COMPOSITOR_VERSION} ({ce.detail}); no reroll is possible without generation"); return fail("SCENE_REUSE_FAILED", f"Scene {slot} of job {reuse['render_job_id']} cannot be composited by the current compositor ({ce.detail}). The existing package is unchanged; a fresh render would need its own authorization and spend.")
                 if ce.code == "UNUSABLE_SCENE":
                     if not guard.can_reroll():
                         chk(f"scene_{slot}", "FAIL", f"scene unusable ({ce.detail}) and the reroll cap of {config.MAX_REROLLS} is reached; the art was not distorted to compensate")
@@ -581,7 +649,8 @@ def run(design_id, evidence, message, provider, handoff_root=config.HANDOFF_ROOT
         manifest = {"schema_version": config.SCHEMA_VERSION, "design_id": did, "render_job_id": job_id, "created_at": now, "result": "READY_FOR_HUMAN_RENDER_REVIEW",
                     "source": {"drive_file_id": info["drive_file_id"], "drive_url": info["drive_url"], "filename": info["filename"], "sha256": info["sha256"], "staged_handoff_path": info["folder"], "staged_source_path": info["staged_path"], "campaign_copy": f"source/{info['filename']}", "lineage": "1901-stage-render-source handoff → exact byte copy → deterministic perspective composite"},
                     "product": {**{k: product[k] for k in ("blank", "provider", "color", "spec_source")}, "garment_rgb": list(product["garment_rgb"])},
-                    "rendering": {"mode": "composited_fidelity", "provider": provider.name, "model": provider.model, "size": size, "quality_mix": config.QUALITY_MIX, "pricing_snapshot": snap, "compositor": "marker-geometry + fringe-aware removal + converged harmonic reconstruction + ring-texture quilting + pillow-perspective + bounded-luminance-multiply", "compositor_version": compositor.COMPOSITOR_VERSION, "compositor_commit": compositor_commit(), "artwork_transformations": "geometric and bounded lighting only"},
+                    "rendering": {"mode": "composited_fidelity", "provider": out["rendering"]["provider"], "model": out["rendering"]["model"], "size": size, "quality_mix": config.QUALITY_MIX, "pricing_snapshot": snap, "compositor": "marker-geometry + fringe-and-rim-aware removal + converged harmonic reconstruction + ring-texture quilting + seam feather + pillow-perspective + bounded-luminance-multiply", "compositor_version": compositor.COMPOSITOR_VERSION, "compositor_commit": compositor_commit(), "artwork_transformations": "geometric and bounded lighting only"},
+                    **({"scene_reuse": {"from_render_job_id": reuse["render_job_id"], "reason": "new governed job on reused base scenes: the approved source and/or the compositor changed; zero generation calls, zero spend", "base_scenes_reused": reuse["base_scenes"], "previous_source_sha256": (reuse["manifest"].get("source") or {}).get("sha256"), "source_sha256": info["sha256"], "previous_compositor_version": (reuse["manifest"].get("rendering") or {}).get("compositor_version"), "compositor_version": compositor.COMPOSITOR_VERSION, "compositor_commit": compositor_commit(), "superseded_package": f"_superseded/{did}-{reuse['render_job_id']}", "superseded_record": f"_superseded/{did}-{reuse['render_job_id']}.SUPERSEDED.json", "superseded_manifest_sha256": reuse["manifest_sha256"], "original_final_sha256": reuse["manifest"].get("final_sha256"), "generation_calls": 0, "estimated_api_cost_usd": 0.0}} if reuse_scenes else {}),
                     "scene_slots": [{"slot": i["slot"], "role": i["role"], "quality": i["quality"], "model": i["model"], "prompt": scene_prompts[f"{i['slot']:02d}-{config.SLOTS[i['slot'] - 1][1]}"], "placement": i["placement"], "rerolls_used_here": i["rerolls_used_here"]} for i in images],
                     "generated_scenes": [i["base_scene"].split("/", 1)[1] for i in images], "final_composites": [i["final_composite"].split("/", 1)[1] for i in images], "final_sha256": {i["final_composite"].split("/", 1)[1]: i["final_sha256"] for i in images},
                     "qa_status": qa_doc["campaign_result"], "qa_path": "qa/qa.json", "contact_sheet": "qa/contact-sheet.png", "estimated_api_cost_usd": guard.job_cost, "reroll_count": guard.rerolls, "cost_log": "cost-log.json",
@@ -598,9 +667,15 @@ def run(design_id, evidence, message, provider, handoff_root=config.HANDOFF_ROOT
     bad_hash = [n for n, h in m2["final_sha256"].items() if not os.path.isfile(os.path.join(tmp, "final-composites", n)) or sha256_bytes(open(os.path.join(tmp, "final-composites", n), "rb").read()) != h]
     if missing or bad_hash or len(m2["final_composites"]) != 6 or m2["publication_authorized"] is not False or sha256_bytes(open(art_path, "rb").read()) != info["sha256"]:
         chk("package_verification", "FAIL", f"missing {missing}, hash mismatches {bad_hash}, finals {len(m2['final_composites'])}"); return fail("VERIFICATION_FAILED", f"The campaign package for {did} did not verify; it was not published.")
-    if os.path.exists(folder):
-        chk("package_verification", "FAIL", "campaign folder appeared during the job; not overwritten"); return fail("CAMPAIGN_CONFLICT", f"A campaign folder for {did} appeared while the job ran; a human must review it.")
-    os.rename(tmp, folder)
+    if reuse_scenes:
+        ok_, detail_, sup_folder, sup_record = supersede_and_publish(campaign_root, did, folder, tmp, reuse["manifest"], reuse["manifest_sha256"], job_id, now, "superseded by a scene-reuse job: the approved source and/or the compositor changed; the first package reached READY_FOR_HUMAN_RENDER_REVIEW")
+        if not ok_:
+            chk("supersession", "FAIL", detail_); return done("VERIFICATION_FAILED", f"The scene-reuse package for {did} could not be published ({detail_}); the original package is in place.") if os.path.exists(folder) else fail("CAMPAIGN_CONFLICT", detail_)
+        chk("supersession", "PASS", f"job {reuse['render_job_id']} moved whole to {sup_folder} (manifest sha256 unchanged) with {os.path.basename(sup_record)} beside it")
+    else:
+        if os.path.exists(folder):
+            chk("package_verification", "FAIL", "campaign folder appeared during the job; not overwritten"); return fail("CAMPAIGN_CONFLICT", f"A campaign folder for {did} appeared while the job ran; a human must review it.")
+        os.rename(tmp, folder)
     ver.update(qa_passed=True, campaign_verified=True); out["render_performed"] = True
     out["campaign"]["images"] = m2["final_composites"]
     chk("package_verification", "PASS", f"{len(expected)} files present, six final composites hash-verified, publication_authorized=false; published atomically to {folder}")

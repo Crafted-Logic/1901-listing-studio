@@ -331,15 +331,20 @@ Two separate concerns, deliberately kept apart:
 The compositor (`studio/compositor.py`, Pillow only, no model call,
 `COMPOSITOR_VERSION` recorded in every placement and manifest) then:
 
-1. **removes the marker and its chroma fringe.** Generated scenes
-   anti-alias the marker edge over 1 to 3 px; those blended pixels fail the
-   strict marker colour but are visibly magenta. The removal mask is the
-   isolated component grown by at most 3 px, one pixel per pass, only into
-   4-neighbours that a relative chroma gate marks as marker-tinted: both
-   R−G and B−G above the clean garment band's (4 to 9 px out) mean by a
-   margin of 6 levels or three times that band's chroma spread. It is never
-   a blind dilation; untinted garment and background pixels are never
-   absorbed. The ring statistics and everything below use this mask;
+1. **removes the marker, its chroma fringe and its drawn rim.** Generated
+   scenes anti-alias the marker edge over 1 to 3 px; those blended pixels
+   fail the strict marker colour but are visibly magenta. The removal mask
+   is the isolated component grown by at most 3 px, never a blind dilation:
+   first one pixel per pass into 4-neighbours that a relative chroma gate
+   marks as marker-tinted (both R−G and B−G above the clean garment band's
+   (4 to 9 px out) mean by 6 levels or three times that band's chroma
+   spread); then, ring by ring within the same 3 px bound, a whole 1 px ring
+   is absorbed when its mean luminance deviates from the clean band by more
+   than max(0.5, 2.5%), which is the panel outline the generator draws as a
+   dark or bright line too faint for any per-pixel test; the first ring
+   that does not deviate stops it. Untinted, un-outlined garment and
+   background pixels are never absorbed. The ring statistics and everything
+   below use this mask;
 2. **reconstructs the garment under it**: the harmonic (Laplace) fill on a
    downsampled grid is relaxed to convergence (largest update below 0.005,
    never a fixed iteration count) so the low-frequency field matches the
@@ -349,10 +354,20 @@ The compositor (`studio/compositor.py`, Pillow only, no model call,
    taken at pseudo-random ring positions, seeded from the marker-free image, and
    ramp-blended over 2 px overlaps. A pure deterministic function of the
    scene: QA recomputes it exactly;
-3. **checks continuity**: the reconstructed interior's mean luminance (mask
-   eroded by 10 px) against the clean band 4 to 9 px out must agree within
-   `max(1.0, 6%)` levels, else the scene is unusable (reroll; in a
-   recomposite, failure). Recorded in `placement.reconstruction.continuity`;
+3. **feathers the seam and checks continuity**: a glow the generator
+   paints around the panel decays over 6 to 12 px, beyond the 3 px bound,
+   so inside the mask only, over the 6 px nearest its edge, the repaired
+   field ramps from the local mean of the scene's 0 to 3 px outside band
+   (normalised box convolution) to its own value; scene pixels outside the
+   mask are never touched. Then two checks: the reconstructed interior's
+   mean luminance (mask eroded by 10 px) against the clean band 4 to 9 px
+   out within `max(1.0, 6%)` levels, and the step continuity across the
+   seam measured on adjacent 3 px bands (the scene's 0 to 3 px band outside
+   against its 3 to 6 px band; the repaired 0 to 3 px band inside against
+   the 0 to 3 px band outside), each within `max(1.0, 5%)` levels, so a
+   soft lighting gradient passes and a line fails. Either failing makes the
+   scene unusable (reroll; in a recomposite or scene-reuse job, failure).
+   Recorded in `placement.reconstruction.continuity` and `.boundary`;
 4. derives the **bounded shading map** from the low-frequency field only
    (fabric texture never prints through the ink): `shade = low / p95(low
    over the print area)`, floored at 0.70, white outside the marker.
@@ -386,7 +401,8 @@ by construction and any post-edit is caught); marker removed before
 placement (zero chroma pixels in the reconstructed base within the
 fringe-aware removal mask; chroma elsewhere in the scene is scenery); no
 residual chroma leak (zero chroma pixels in the final where the marker was
-and the art does not cover); **no marker fringe** (visibly marker-tinted
+and the art does not cover); **boundary continuity** (adjacent-band steps across the repair seam within
+`max(1.0, 5%)`); **no marker fringe** (visibly marker-tinted
 pixels, by the relative chroma gate at a 12-level margin, in the 0 to 4 px
 band outside the repaired region of the final may not exceed the clean 4 to
 9 px band's own rate plus 0.2% of the band, so a scene's natural chroma is
@@ -407,6 +423,30 @@ composite and report what it sees; the human decides.
 
 Campaign-level checks: source identity consistent, garment consistent,
 artwork consistent, six required images present.
+
+## Scene Reuse After a Source Change
+
+When the approved source changes (a newly staged prepared derivative) or
+the compositor changes, a **new governed render job** may reuse the six
+stored base scenes of the existing reviewed package instead of generating:
+`render.py run --reuse-scenes --design-id <id> --evidence … --message
+"<verbatim>"`. Every governance check runs exactly as for a render (queue,
+approval, source, handoff, staged source, product specification,
+transparency); provider, pricing and budget checks are replaced by a
+verification of the existing package (result, six finals hash-matched, six
+base scenes present) and a zero-cost plan; `ALREADY_CURRENT` when the
+package already has this source and compositor. The same exact command
+`AUTHORIZE LISTING RENDER <design_id>` authorizes it; the proposal says
+"scene-reuse job" and "zero generation calls, zero spend". No provider is
+constructed. A stored scene the current compositor cannot use →
+`SCENE_REUSE_FAILED`, nothing changed (no reroll without generation). On
+success the existing package is superseded exactly as in a recomposite
+(whole, by rename, with its `SUPERSEDED.json`), and the new manifest's
+`scene_reuse` block records the reused job, every base scene's SHA-256,
+the previous and new source hashes, the previous and new compositor
+version and commit, the superseded paths and hashes, `generation_calls:
+0` and `estimated_api_cost_usd: 0.0`; the cost log records zero images and
+zero calls. History for every earlier job stays under `_superseded/`.
 
 ## Recomposite and Supersession
 
@@ -633,6 +673,7 @@ for every job that ran. `human_action_required` is `null` for
 | `ALREADY_CURRENT` | no | none | The package was composited with the current compositor |
 | `CAMPAIGN_NOT_FOUND` | no | none | No package to recomposite |
 | `RECOMPOSITE_FAILED` | no | none | A stored scene cannot be composited by the current compositor; original untouched |
+| `SCENE_REUSE_FAILED` | no | none | Scene-reuse job: a stored scene cannot be composited; original untouched |
 
 ## Pitfalls
 
@@ -650,6 +691,14 @@ for every job that ran. `human_action_required` is `null` for
   pixels are ignored. If a scene still fails, read the reason: too small,
   more than one plausible component, not a solid panel, touching the edge,
   or the separate garment-ring check.
+- **A faint line or soft rectangle at the panel edge after the 2026-10-02
+  correction.** Two sources, diagnosed on job `863b478926-rc1`: the
+  generator's drawn panel outline and glow just outside the marker (now
+  removed ring by ring within 3 px and feathered inside), and residual
+  alpha haze in the prepared derivative itself (alpha 1 to 31 over its
+  whole extent), which the compositor renders faithfully and never clips:
+  that is fixed by a cleaned, human-approved derivative staged through
+  Skill #6 and a scene-reuse job.
 - **The job failed on a validator defect; reroll it for free.** There is no
   free job. A human records the ruling beside the failed folder, and a new
   job runs under a fresh exact authorization with the normal cap and the
@@ -754,7 +803,9 @@ Input: `Render the listing campaign for 1901-093.` Zero generation calls, no cam
    "high": 2,
    "medium": 4
   },
-  "mode": "composited_fidelity"
+  "mode": "composited_fidelity",
+  "compositor_version": "2026-10-03.4",
+  "scene_reuse": null
  },
  "authorization": {
   "received": false,
@@ -939,7 +990,9 @@ Input: `AUTHORIZE LISTING RENDER 1901-093`, in a new run. Six scenes, six determ
    "high": 2,
    "medium": 4
   },
-  "mode": "composited_fidelity"
+  "mode": "composited_fidelity",
+  "compositor_version": "2026-10-03.4",
+  "scene_reuse": null
  },
  "authorization": {
   "received": true,
@@ -1258,7 +1311,9 @@ Target `1901-093`; input `AUTHORIZE LISTING RENDER 1901-094`.
    "high": 2,
    "medium": 4
   },
-  "mode": "composited_fidelity"
+  "mode": "composited_fidelity",
+  "compositor_version": "2026-10-03.4",
+  "scene_reuse": null
  },
  "authorization": {
   "received": false,
@@ -1443,7 +1498,9 @@ Scene 2 came back with no usable print area; one reroll, counted and costed.
    "high": 2,
    "medium": 4
   },
-  "mode": "composited_fidelity"
+  "mode": "composited_fidelity",
+  "compositor_version": "2026-10-03.4",
+  "scene_reuse": null
  },
  "authorization": {
   "received": true,
@@ -1775,7 +1832,9 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
    "high": 2,
    "medium": 4
   },
-  "mode": "composited_fidelity"
+  "mode": "composited_fidelity",
+  "compositor_version": "2026-10-03.4",
+  "scene_reuse": null
  },
  "authorization": {
   "received": true,
@@ -2032,7 +2091,9 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
    "high": 2,
    "medium": 4
   },
-  "mode": "composited_fidelity"
+  "mode": "composited_fidelity",
+  "compositor_version": "2026-10-03.4",
+  "scene_reuse": null
  },
  "authorization": {
   "received": false,
@@ -2163,7 +2224,9 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
    "high": 2,
    "medium": 4
   },
-  "mode": "composited_fidelity"
+  "mode": "composited_fidelity",
+  "compositor_version": "2026-10-03.4",
+  "scene_reuse": null
  },
  "authorization": {
   "received": false,
@@ -2294,7 +2357,9 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
    "high": 2,
    "medium": 4
   },
-  "mode": "composited_fidelity"
+  "mode": "composited_fidelity",
+  "compositor_version": "2026-10-03.4",
+  "scene_reuse": null
  },
  "authorization": {
   "received": false,
@@ -2405,7 +2470,9 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
    "high": 2,
    "medium": 4
   },
-  "mode": "composited_fidelity"
+  "mode": "composited_fidelity",
+  "compositor_version": "2026-10-03.4",
+  "scene_reuse": null
  },
  "authorization": {
   "received": false,
@@ -2516,7 +2583,9 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
    "high": 2,
    "medium": 4
   },
-  "mode": "composited_fidelity"
+  "mode": "composited_fidelity",
+  "compositor_version": "2026-10-03.4",
+  "scene_reuse": null
  },
  "authorization": {
   "received": false,
@@ -2642,7 +2711,9 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
    "high": 2,
    "medium": 4
   },
-  "mode": "composited_fidelity"
+  "mode": "composited_fidelity",
+  "compositor_version": "2026-10-03.4",
+  "scene_reuse": null
  },
  "authorization": {
   "received": false,
@@ -2748,7 +2819,9 @@ The reroll landed exactly on the monthly cap; the next call would exceed it and 
    "high": 2,
    "medium": 4
   },
-  "mode": "composited_fidelity"
+  "mode": "composited_fidelity",
+  "compositor_version": "2026-10-03.4",
+  "scene_reuse": null
  },
  "authorization": {
   "received": false,
@@ -2856,7 +2929,9 @@ The hero composite was modified after compositing (simulated re-lettering); the 
    "high": 2,
    "medium": 4
   },
-  "mode": "composited_fidelity"
+  "mode": "composited_fidelity",
+  "compositor_version": "2026-10-03.4",
+  "scene_reuse": null
  },
  "authorization": {
   "received": true,
@@ -3063,7 +3138,9 @@ The reconstructed base still held marker pixels (simulated); deterministic QA re
    "high": 2,
    "medium": 4
   },
-  "mode": "composited_fidelity"
+  "mode": "composited_fidelity",
+  "compositor_version": "2026-10-03.4",
+  "scene_reuse": null
  },
  "authorization": {
   "received": true,
@@ -3277,7 +3354,9 @@ The reconstructed base still held marker pixels (simulated); deterministic QA re
    "high": 2,
    "medium": 4
   },
-  "mode": "composited_fidelity"
+  "mode": "composited_fidelity",
+  "compositor_version": "2026-10-03.4",
+  "scene_reuse": null
  },
  "authorization": {
   "received": false,
@@ -3434,23 +3513,23 @@ Input: `Recomposite the 1901-093 campaign with the corrected compositor.` A revi
  "supersedes": {
   "render_job_id": "origjob001",
   "folder": "/home/claude/agents/1901/shared/render-campaigns/1901-093",
-  "manifest_sha256": "fcdba632ebc93362e88ed527f50b666f3147babf73091a74b470ba235b251059",
+  "manifest_sha256": "52b956532cec11c94b29a3bc47892ec57ee3c109610590dad527dd554d0bb683",
   "original_result": "READY_FOR_HUMAN_RENDER_REVIEW",
   "original_estimated_api_cost_usd": 0.6,
   "original_final_sha256": {
-   "01-hero.png": "e4c5c67e97c12cebbb5f4486d15124a1d5f0250ee8a79fcd142f5c58bc238326",
-   "02-story.png": "c5f36a68b8548f1f37bfe9ef0f3ec0985c438697cb4cf39b5348baa4a6d935a5",
-   "03-travel.png": "94fb006aecb621fdc1004aafc1435a62bdf8359b52f4a781ad4b10be71baac98",
-   "04-flatlay.png": "d5d3ba266da9b324404de5cce5e41796291276d4401161a5ca7e0753669d7fac",
-   "05-folded.png": "62ea96100fd0c7c3e81e368a514736f930519d3c4617b315bead657603a6ad0f",
-   "06-detail.png": "45ba157afad34ab51100ff577a31f7ebd904f122f6d42aa4813b59557e7a1a61"
+   "01-hero.png": "fa30c1591b5777b7745110bd2ef5122608de0778e03ae9266291ccebceffaf12",
+   "02-story.png": "31c84a032b78074760a5a7b24b237ff6e0a3e4b3006ca6675910d42d0a71048a",
+   "03-travel.png": "39973e01fc6360f45c538412fc792c2b53e6bae4535e9aacc796d44358a95d6d",
+   "04-flatlay.png": "f6c2f23df909b611cf106477e522b0c332dd38db67420616086f08ab403abf5b",
+   "05-folded.png": "e7aedadfdee038fbddb9cfe57f2d7b7b79c3f36fe3511dc0c17db5e9bcffd271",
+   "06-detail.png": "2cf9da631c09a9c021076566b891faf74f9d80b59a69391c4c3678e9648edab2"
   }
  },
  "generation_calls": 0,
  "estimated_api_cost_usd": 0.0,
  "compositor": {
-  "version": "2026-10-02.3",
-  "commit": "1ccf4a7c6766"
+  "version": "2026-10-03.4",
+  "commit": "4600e85f76a8"
  },
  "timestamp": "2026-10-01T02:00:00Z",
  "campaign": {
@@ -3474,7 +3553,7 @@ Input: `Recomposite the 1901-093 campaign with the corrected compositor.` A revi
   {
    "check": "compositor_version",
    "status": "PASS",
-   "detail": "package compositor 'old' → current 2026-10-02.3 (commit 1ccf4a7c6766)"
+   "detail": "package compositor 'old' → current 2026-10-03.4 (commit 4600e85f76a8)"
   },
   {
    "check": "source",
@@ -3492,7 +3571,7 @@ Input: `Recomposite the 1901-093 campaign with the corrected compositor.` A revi
    "detail": "the current run does not contain the exact command AUTHORIZE LISTING RECOMPOSITE 1901-093; nothing was changed"
   }
  ],
- "human_action_required": "Nothing changed. Job origjob001 for 1901-093 would be recomposited locally with compositor 2026-10-02.3 from its six stored base scenes and the exact source (sha256 5211ed2ff15b…), with no generation call and no spend, as job origjob001-rc1; the current package would move whole to /home/claude/agents/1901/shared/render-campaigns/_superseded/1901-093-origjob001 with 1901-093-origjob001.SUPERSEDED.json beside it, and the new package would be published at /home/claude/agents/1901/shared/render-campaigns/1901-093 for human review. To authorize exactly this, send exactly: AUTHORIZE LISTING RECOMPOSITE 1901-093"
+ "human_action_required": "Nothing changed. Job origjob001 for 1901-093 would be recomposited locally with compositor 2026-10-03.4 from its six stored base scenes and the exact source (sha256 5211ed2ff15b…), with no generation call and no spend, as job origjob001-rc1; the current package would move whole to /home/claude/agents/1901/shared/render-campaigns/_superseded/1901-093-origjob001 with 1901-093-origjob001.SUPERSEDED.json beside it, and the new package would be published at /home/claude/agents/1901/shared/render-campaigns/1901-093 for human review. To authorize exactly this, send exactly: AUTHORIZE LISTING RECOMPOSITE 1901-093"
 }
 ```
 
@@ -3509,23 +3588,23 @@ Input: `AUTHORIZE LISTING RECOMPOSITE 1901-093`. The original package moved whol
  "supersedes": {
   "render_job_id": "origjob001",
   "folder": "/home/claude/agents/1901/shared/render-campaigns/1901-093",
-  "manifest_sha256": "fcdba632ebc93362e88ed527f50b666f3147babf73091a74b470ba235b251059",
+  "manifest_sha256": "52b956532cec11c94b29a3bc47892ec57ee3c109610590dad527dd554d0bb683",
   "original_result": "READY_FOR_HUMAN_RENDER_REVIEW",
   "original_estimated_api_cost_usd": 0.6,
   "original_final_sha256": {
-   "01-hero.png": "e4c5c67e97c12cebbb5f4486d15124a1d5f0250ee8a79fcd142f5c58bc238326",
-   "02-story.png": "c5f36a68b8548f1f37bfe9ef0f3ec0985c438697cb4cf39b5348baa4a6d935a5",
-   "03-travel.png": "94fb006aecb621fdc1004aafc1435a62bdf8359b52f4a781ad4b10be71baac98",
-   "04-flatlay.png": "d5d3ba266da9b324404de5cce5e41796291276d4401161a5ca7e0753669d7fac",
-   "05-folded.png": "62ea96100fd0c7c3e81e368a514736f930519d3c4617b315bead657603a6ad0f",
-   "06-detail.png": "45ba157afad34ab51100ff577a31f7ebd904f122f6d42aa4813b59557e7a1a61"
+   "01-hero.png": "fa30c1591b5777b7745110bd2ef5122608de0778e03ae9266291ccebceffaf12",
+   "02-story.png": "31c84a032b78074760a5a7b24b237ff6e0a3e4b3006ca6675910d42d0a71048a",
+   "03-travel.png": "39973e01fc6360f45c538412fc792c2b53e6bae4535e9aacc796d44358a95d6d",
+   "04-flatlay.png": "f6c2f23df909b611cf106477e522b0c332dd38db67420616086f08ab403abf5b",
+   "05-folded.png": "e7aedadfdee038fbddb9cfe57f2d7b7b79c3f36fe3511dc0c17db5e9bcffd271",
+   "06-detail.png": "2cf9da631c09a9c021076566b891faf74f9d80b59a69391c4c3678e9648edab2"
   }
  },
  "generation_calls": 0,
  "estimated_api_cost_usd": 0.0,
  "compositor": {
-  "version": "2026-10-02.3",
-  "commit": "1ccf4a7c6766"
+  "version": "2026-10-03.4",
+  "commit": "4600e85f76a8"
  },
  "timestamp": "2026-10-01T02:00:00Z",
  "campaign": {
@@ -3549,7 +3628,7 @@ Input: `AUTHORIZE LISTING RECOMPOSITE 1901-093`. The original package moved whol
   {
    "check": "compositor_version",
    "status": "PASS",
-   "detail": "package compositor 'old' → current 2026-10-02.3 (commit 1ccf4a7c6766)"
+   "detail": "package compositor 'old' → current 2026-10-03.4 (commit 4600e85f76a8)"
   },
   {
    "check": "source",
@@ -3610,6 +3689,456 @@ Input: `AUTHORIZE LISTING RECOMPOSITE 1901-093`. The original package moved whol
    "check": "package_verification",
    "status": "PASS",
    "detail": "20 files present, six finals hash-verified, six base scenes byte-identical to the superseded package, publication_authorized=false, generation_calls=0"
+  }
+ ],
+ "human_action_required": null
+}
+```
+
+### R. Scene-reuse proposal after a source change: AWAITING_RENDER_AUTHORIZATION
+
+Input: `Render the listing campaign for 1901-093.` with `--reuse-scenes`. The staged handoff now carries a new approved source; the existing reviewed package's six base scenes would be reused with zero generation calls.
+
+```json
+{
+ "design_id": "1901-093",
+ "result": "AWAITING_RENDER_AUTHORIZATION",
+ "render_performed": false,
+ "render_job_id": "",
+ "timestamp": "2026-10-01T02:00:00Z",
+ "source": {
+  "drive_file_id": "1WloiO2PNmvIZHQWBsYyYjqDCQOlae6Ve",
+  "filename": "1901-093-B.png",
+  "sha256": "4ab3e6002affe17f10ed1a38e0f025dabd76b546f9606a3e9bd2781269a6c9d8",
+  "staged_path": "/home/claude/agents/1901/shared/render-handoffs/1901-093/source/1901-093-B.png"
+ },
+ "product": {
+  "blank": "Unisex Heavy Cotton Tee",
+  "provider": "Printify Choice",
+  "color": "Black",
+  "spec_source": "fixture"
+ },
+ "campaign": {
+  "root": "/home/claude/agents/1901/shared/render-campaigns/",
+  "design_folder": "/home/claude/agents/1901/shared/render-campaigns/1901-093",
+  "manifest_path": "/home/claude/agents/1901/shared/render-campaigns/1901-093/manifest.json",
+  "qa_path": "/home/claude/agents/1901/shared/render-campaigns/1901-093/qa/qa.json",
+  "contact_sheet_path": "/home/claude/agents/1901/shared/render-campaigns/1901-093/qa/contact-sheet.png",
+  "images": [
+   "01-hero.png",
+   "02-story.png",
+   "03-travel.png",
+   "04-flatlay.png",
+   "05-folded.png",
+   "06-detail.png"
+  ]
+ },
+ "budget": {
+  "per_listing_limit_usd": 2.0,
+  "monthly_limit_usd": 25.0,
+  "estimated_job_cost_usd": 0.0,
+  "monthly_recorded_cost_usd": 3.1,
+  "projected_monthly_cost_usd": 3.1,
+  "budget_flag": "OK"
+ },
+ "verification": {
+  "queue_verified": true,
+  "human_approval_verified": true,
+  "source_verified": true,
+  "handoff_verified": true,
+  "product_spec_verified": true,
+  "pricing_verified": true,
+  "budget_verified": true,
+  "qa_passed": false,
+  "campaign_verified": false
+ },
+ "rendering": {
+  "provider": "mock",
+  "model": "mock-image-1",
+  "size": "1024x1024",
+  "quality_mix": {
+   "high": 2,
+   "medium": 4
+  },
+  "mode": "composited_fidelity",
+  "compositor_version": "2026-10-03.4",
+  "scene_reuse": {
+   "from_render_job_id": "genjob0001",
+   "base_scenes_reused": {
+    "01-hero-base.png": "4fa17ed5af2bd925014ee8b217b45adac8a0dd45283744b04f41b03d0af3bf41",
+    "02-story-base.png": "6249612260907bd27f41f10ca8978301871191f4396ef69e7432fe11702965c7",
+    "03-travel-base.png": "76254e04492d8a731a0e2ee0d84ca1d9813a17d6ce329bef95e5eee2ff216e09",
+    "04-flatlay-base.png": "2f2e9395ab16ebb810fa4329325b34d33ae371b2b095d90f255ab332b0e297de",
+    "05-folded-base.png": "9c06d6a0159824b004960a3b147bd4ff2c7efcbb55bd6f1a56a29ffbd31d2fc1",
+    "06-detail-base.png": "e2f4ef7222f9fa9e4b17ed0d6ba7b9dd6388866f2bf073c652b339c7ecf94617"
+   },
+   "previous_source_sha256": "5211ed2ff15b370ae478caafe34bb2d55abb60a4fdd8f79521af2a8d416f2916",
+   "previous_compositor_version": "2026-10-03.4",
+   "generation_calls": 0
+  }
+ },
+ "authorization": {
+  "received": false,
+  "evidence": ""
+ },
+ "prior_failed_jobs": [],
+ "proposed_expense_log_row": {
+  "design_id": "1901-093",
+  "model": "mock/mock-image-1",
+  "size": "1024x1024",
+  "quality_mix": {
+   "high": 2,
+   "medium": 4
+  },
+  "source_drive_id": "1WloiO2PNmvIZHQWBsYyYjqDCQOlae6Ve",
+  "source_sha256": "4ab3e6002affe17f10ed1a38e0f025dabd76b546f9606a3e9bd2781269a6c9d8",
+  "pricing_snapshot": {
+   "provider": "mock",
+   "model": "mock-image-1",
+   "size": "1024x1024",
+   "captured_at": "2026-10-01T00:00:00Z",
+   "basis": "fixture pricing for tests",
+   "currency": "USD",
+   "per_image_usd": {
+    "high": {
+     "1024x1024": 0.2
+    },
+    "medium": {
+     "1024x1024": 0.05
+    }
+   }
+  },
+  "campaign_folder": "/home/claude/agents/1901/shared/render-campaigns/1901-093",
+  "render_job_id": "",
+  "started_at": "",
+  "completed_at": "",
+  "images_generated": 0,
+  "rerolls": 0,
+  "usage_record": [],
+  "estimated_api_cost_usd": 0.0,
+  "job_status": "PROPOSED",
+  "budget_flag": "OK",
+  "notes": [
+   "proposal only; no generation call made"
+  ],
+  "actual_billed_cost_usd": null
+ },
+ "warnings": [],
+ "checks": [
+  {
+   "check": "input",
+   "status": "PASS",
+   "detail": "design_id '1901-093' (trimmed)"
+  },
+  {
+   "check": "queue_read",
+   "status": "PASS",
+   "detail": "exactly one row (sheet row 95) carries id 1901-093"
+  },
+  {
+   "check": "human_approval",
+   "status": "PASS",
+   "detail": "human_decision is exactly APPROVE and status is exactly Approved"
+  },
+  {
+   "check": "source_identity",
+   "status": "PASS",
+   "detail": "render_source_path and the resolver name the same Drive file 1WloiO2PNmvIZHQWBsYyYjqDCQOlae6Ve"
+  },
+  {
+   "check": "governance",
+   "status": "PASS",
+   "detail": "1901-prepare-production-handoff reports no unresolved blocker for this design"
+  },
+  {
+   "check": "staged_handoff",
+   "status": "PASS",
+   "detail": "handoff valid: manifest, authority, integrity and SHA-256 all verified"
+  },
+  {
+   "check": "source_image",
+   "status": "PASS",
+   "detail": "1400x1000px, bands RGBA, alpha=yes"
+  },
+  {
+   "check": "product_spec",
+   "status": "PASS",
+   "detail": "Unisex Heavy Cotton Tee / Printify Choice / Black from fixture"
+  },
+  {
+   "check": "scene_reuse",
+   "status": "PASS",
+   "detail": "six base scenes of job genjob0001 verified and will be reused (mock / mock-image-1, 1024x1024); previous source 5211ed2ff15b… → 4ab3e6002aff…, compositor '2026-10-03.4' → 2026-10-03.4; no generation call"
+  },
+  {
+   "check": "pricing",
+   "status": "PASS",
+   "detail": "scene reuse: no generation call, no per-image cost"
+  },
+  {
+   "check": "budget",
+   "status": "PASS",
+   "detail": "planned campaign $0.0000 ≤ $2.00; month $3.1000 → $3.1000 ≤ $25.00"
+  },
+  {
+   "check": "existing_campaign",
+   "status": "INFO",
+   "detail": "existing package (job genjob0001) will be superseded whole by this job; nothing is overwritten"
+  },
+  {
+   "check": "authorization",
+   "status": "FAIL",
+   "detail": "the current run does not contain the exact command AUTHORIZE LISTING RENDER 1901-093; ordinary requests and vague confirmations never authorize rendering"
+  }
+ ],
+ "human_action_required": "No generation call made and no campaign files created. 1901-093 is eligible for a scene-reuse job: source 1901-093-B.png (Drive id 1WloiO2PNmvIZHQWBsYyYjqDCQOlae6Ve, sha256 4ab3e6002aff…) staged at /home/claude/agents/1901/shared/render-handoffs/1901-093/source/1901-093-B.png; product Unisex Heavy Cotton Tee / Printify Choice / Black; the six base scenes of job genjob0001 reused with compositor 2026-10-03.4, zero generation calls, zero spend; the existing package would move whole to _superseded and the new job would be published at /home/claude/agents/1901/shared/render-campaigns/1901-093. To authorize exactly this job, send exactly: AUTHORIZE LISTING RENDER 1901-093"
+}
+```
+
+### S. Authorised scene-reuse job: READY_FOR_HUMAN_RENDER_REVIEW
+
+Input: `AUTHORIZE LISTING RENDER 1901-093` with `--reuse-scenes`. New job id, new source hash, six scenes reused and hashed in `scene_reuse`, original package superseded whole.
+
+```json
+{
+ "design_id": "1901-093",
+ "result": "READY_FOR_HUMAN_RENDER_REVIEW",
+ "render_performed": true,
+ "render_job_id": "reusejob01",
+ "timestamp": "2026-10-01T02:00:00Z",
+ "source": {
+  "drive_file_id": "1WloiO2PNmvIZHQWBsYyYjqDCQOlae6Ve",
+  "filename": "1901-093-B.png",
+  "sha256": "4ab3e6002affe17f10ed1a38e0f025dabd76b546f9606a3e9bd2781269a6c9d8",
+  "staged_path": "/home/claude/agents/1901/shared/render-handoffs/1901-093/source/1901-093-B.png"
+ },
+ "product": {
+  "blank": "Unisex Heavy Cotton Tee",
+  "provider": "Printify Choice",
+  "color": "Black",
+  "spec_source": "fixture"
+ },
+ "campaign": {
+  "root": "/home/claude/agents/1901/shared/render-campaigns/",
+  "design_folder": "/home/claude/agents/1901/shared/render-campaigns/1901-093",
+  "manifest_path": "/home/claude/agents/1901/shared/render-campaigns/1901-093/manifest.json",
+  "qa_path": "/home/claude/agents/1901/shared/render-campaigns/1901-093/qa/qa.json",
+  "contact_sheet_path": "/home/claude/agents/1901/shared/render-campaigns/1901-093/qa/contact-sheet.png",
+  "images": [
+   "01-hero.png",
+   "02-story.png",
+   "03-travel.png",
+   "04-flatlay.png",
+   "05-folded.png",
+   "06-detail.png"
+  ]
+ },
+ "budget": {
+  "per_listing_limit_usd": 2.0,
+  "monthly_limit_usd": 25.0,
+  "estimated_job_cost_usd": 0.0,
+  "monthly_recorded_cost_usd": 3.1,
+  "projected_monthly_cost_usd": 3.1,
+  "budget_flag": "OK"
+ },
+ "verification": {
+  "queue_verified": true,
+  "human_approval_verified": true,
+  "source_verified": true,
+  "handoff_verified": true,
+  "product_spec_verified": true,
+  "pricing_verified": true,
+  "budget_verified": true,
+  "qa_passed": true,
+  "campaign_verified": true
+ },
+ "rendering": {
+  "provider": "mock",
+  "model": "mock-image-1",
+  "size": "1024x1024",
+  "quality_mix": {
+   "high": 2,
+   "medium": 4
+  },
+  "mode": "composited_fidelity",
+  "compositor_version": "2026-10-03.4",
+  "scene_reuse": {
+   "from_render_job_id": "genjob0001",
+   "base_scenes_reused": {
+    "01-hero-base.png": "4fa17ed5af2bd925014ee8b217b45adac8a0dd45283744b04f41b03d0af3bf41",
+    "02-story-base.png": "6249612260907bd27f41f10ca8978301871191f4396ef69e7432fe11702965c7",
+    "03-travel-base.png": "76254e04492d8a731a0e2ee0d84ca1d9813a17d6ce329bef95e5eee2ff216e09",
+    "04-flatlay-base.png": "2f2e9395ab16ebb810fa4329325b34d33ae371b2b095d90f255ab332b0e297de",
+    "05-folded-base.png": "9c06d6a0159824b004960a3b147bd4ff2c7efcbb55bd6f1a56a29ffbd31d2fc1",
+    "06-detail-base.png": "e2f4ef7222f9fa9e4b17ed0d6ba7b9dd6388866f2bf073c652b339c7ecf94617"
+   },
+   "previous_source_sha256": "5211ed2ff15b370ae478caafe34bb2d55abb60a4fdd8f79521af2a8d416f2916",
+   "previous_compositor_version": "2026-10-03.4",
+   "generation_calls": 0
+  }
+ },
+ "authorization": {
+  "received": true,
+  "evidence": "AUTHORIZE LISTING RENDER 1901-093"
+ },
+ "prior_failed_jobs": [],
+ "proposed_expense_log_row": {
+  "design_id": "1901-093",
+  "model": "mock/mock-image-1",
+  "size": "1024x1024",
+  "quality_mix": {
+   "high": 2,
+   "medium": 4
+  },
+  "source_drive_id": "1WloiO2PNmvIZHQWBsYyYjqDCQOlae6Ve",
+  "source_sha256": "4ab3e6002affe17f10ed1a38e0f025dabd76b546f9606a3e9bd2781269a6c9d8",
+  "pricing_snapshot": {
+   "provider": "mock",
+   "model": "mock-image-1",
+   "size": "1024x1024",
+   "captured_at": "2026-10-01T00:00:00Z",
+   "basis": "fixture pricing for tests",
+   "currency": "USD",
+   "per_image_usd": {
+    "high": {
+     "1024x1024": 0.2
+    },
+    "medium": {
+     "1024x1024": 0.05
+    }
+   }
+  },
+  "campaign_folder": "/home/claude/agents/1901/shared/render-campaigns/1901-093",
+  "render_job_id": "reusejob01",
+  "started_at": "2026-10-01T02:00:00Z",
+  "completed_at": "2026-10-01T02:00:00Z",
+  "images_generated": 0,
+  "rerolls": 0,
+  "usage_record": [],
+  "estimated_api_cost_usd": 0.0,
+  "job_status": "COMPLETED",
+  "budget_flag": "OK",
+  "notes": [
+   "scene reuse from job genjob0001: no generation call; no spend"
+  ],
+  "actual_billed_cost_usd": null
+ },
+ "warnings": [],
+ "checks": [
+  {
+   "check": "input",
+   "status": "PASS",
+   "detail": "design_id '1901-093' (trimmed)"
+  },
+  {
+   "check": "queue_read",
+   "status": "PASS",
+   "detail": "exactly one row (sheet row 95) carries id 1901-093"
+  },
+  {
+   "check": "human_approval",
+   "status": "PASS",
+   "detail": "human_decision is exactly APPROVE and status is exactly Approved"
+  },
+  {
+   "check": "source_identity",
+   "status": "PASS",
+   "detail": "render_source_path and the resolver name the same Drive file 1WloiO2PNmvIZHQWBsYyYjqDCQOlae6Ve"
+  },
+  {
+   "check": "governance",
+   "status": "PASS",
+   "detail": "1901-prepare-production-handoff reports no unresolved blocker for this design"
+  },
+  {
+   "check": "staged_handoff",
+   "status": "PASS",
+   "detail": "handoff valid: manifest, authority, integrity and SHA-256 all verified"
+  },
+  {
+   "check": "source_image",
+   "status": "PASS",
+   "detail": "1400x1000px, bands RGBA, alpha=yes"
+  },
+  {
+   "check": "product_spec",
+   "status": "PASS",
+   "detail": "Unisex Heavy Cotton Tee / Printify Choice / Black from fixture"
+  },
+  {
+   "check": "scene_reuse",
+   "status": "PASS",
+   "detail": "six base scenes of job genjob0001 verified and will be reused (mock / mock-image-1, 1024x1024); previous source 5211ed2ff15b… → 4ab3e6002aff…, compositor '2026-10-03.4' → 2026-10-03.4; no generation call"
+  },
+  {
+   "check": "pricing",
+   "status": "PASS",
+   "detail": "scene reuse: no generation call, no per-image cost"
+  },
+  {
+   "check": "budget",
+   "status": "PASS",
+   "detail": "planned campaign $0.0000 ≤ $2.00; month $3.1000 → $3.1000 ≤ $25.00"
+  },
+  {
+   "check": "existing_campaign",
+   "status": "INFO",
+   "detail": "existing package (job genjob0001) will be superseded whole by this job; nothing is overwritten"
+  },
+  {
+   "check": "authorization",
+   "status": "PASS",
+   "detail": "current run contains the exact command: AUTHORIZE LISTING RENDER 1901-093"
+  },
+  {
+   "check": "source_copy",
+   "status": "PASS",
+   "detail": "exact source bytes, the handoff manifest and source-reference.json recorded in the job"
+  },
+  {
+   "check": "scene_1",
+   "status": "PASS",
+   "detail": "hero_lifestyle (high) generated, composited at scale 0.205, deterministic QA PASS"
+  },
+  {
+   "check": "scene_2",
+   "status": "PASS",
+   "detail": "secondary_lifestyle_story (high) generated, composited at scale 0.2364, deterministic QA PASS"
+  },
+  {
+   "check": "scene_3",
+   "status": "PASS",
+   "detail": "travel_packing (medium) generated, composited at scale 0.1464, deterministic QA PASS"
+  },
+  {
+   "check": "scene_4",
+   "status": "PASS",
+   "detail": "editorial_flat_lay (medium) generated, composited at scale 0.2521, deterministic QA PASS"
+  },
+  {
+   "check": "scene_5",
+   "status": "PASS",
+   "detail": "folded_garment_detail (medium) generated, composited at scale 0.175, deterministic QA PASS"
+  },
+  {
+   "check": "scene_6",
+   "status": "PASS",
+   "detail": "product_construction_detail (medium) generated, composited at scale 0.1464, deterministic QA PASS"
+  },
+  {
+   "check": "manifest",
+   "status": "PASS",
+   "detail": "qa.json, contact-sheet.png, cost-log.json and manifest.json written"
+  },
+  {
+   "check": "supersession",
+   "status": "PASS",
+   "detail": "job genjob0001 moved whole to /home/claude/agents/1901/shared/render-campaigns/_superseded/1901-093-genjob0001 (manifest sha256 unchanged) with 1901-093-genjob0001.SUPERSEDED.json beside it"
+  },
+  {
+   "check": "package_verification",
+   "status": "PASS",
+   "detail": "19 files present, six final composites hash-verified, publication_authorized=false; published atomically to /home/claude/agents/1901/shared/render-campaigns/1901-093"
   }
  ],
  "human_action_required": null
